@@ -34,7 +34,8 @@ param (
     [string]$namingPrefix,
     [string]$debugEnabled,
     [string]$sqlServerEdition,
-    [string]$autoShutdownEnabled
+    [string]$autoShutdownEnabled,
+    [string]$azureEnvironment = 'AzureCloud'
 )
 
 [System.Environment]::SetEnvironmentVariable('adminUsername', $adminUsername, [System.EnvironmentVariableTarget]::Machine)
@@ -70,6 +71,7 @@ param (
 [System.Environment]::SetEnvironmentVariable('ArcBoxDir', "C:\ArcBox", [System.EnvironmentVariableTarget]::Machine)
 [System.Environment]::SetEnvironmentVariable('sqlServerEdition', $sqlServerEdition, [System.EnvironmentVariableTarget]::Machine)
 [System.Environment]::SetEnvironmentVariable('autoShutdownEnabled', $autoShutdownEnabled, [System.EnvironmentVariableTarget]::Machine)
+[System.Environment]::SetEnvironmentVariable('azureEnvironment', $azureEnvironment, [System.EnvironmentVariableTarget]::Machine)
 
 if ($debugEnabled -eq "true") {
     [System.Environment]::SetEnvironmentVariable('ErrorActionPreference', "Break", [System.EnvironmentVariableTarget]::Machine)
@@ -118,9 +120,7 @@ Start-Transcript -Path $Env:ArcBoxLogsDir\Bootstrap.log
 # Set SyncForegroundPolicy to 1 to ensure that the scheduled task runs after the client VM joins the domain
 Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "SyncForegroundPolicy" 1
 
-# Copy PowerShell Profile and Reload
-Invoke-WebRequest ($templateBaseUrl + "artifacts/PSProfile.ps1") -OutFile $PsHome\Profile.ps1
-.$PsHome\Profile.ps1
+# Note: PSProfile.ps1 download moved to after Az login (requires MI auth for private blob storage)
 
 # Extending C:\ partition to the maximum size
 Write-Host "Extending C:\ partition to the maximum size"
@@ -147,7 +147,79 @@ Import-Module Az.Resources -RequiredVersion 9.0.0 -Force
 
 $DeploymentProgressString = "Started bootstrap-script..."
 
-Connect-AzAccount -Identity
+# Set Azure cloud environment for Azure Government (only if az CLI is already installed)
+if ($azureEnvironment -eq 'AzureUSGovernment') {
+    $azCmd = Get-Command az -ErrorAction SilentlyContinue
+    if ($azCmd) {
+        az cloud set --name AzureUSGovernment
+    } else {
+        Write-Host "az CLI not yet installed - skipping 'az cloud set'. Will be configured in logon scripts."
+    }
+}
+
+# Connect via managed identity with retries (MI may take time to become available)
+$miConnected = $false
+for ($miAttempt = 1; $miAttempt -le 20; $miAttempt++) {
+    try {
+        Write-Host "Connect-AzAccount -Identity attempt $miAttempt of 20..."
+        if ($azureEnvironment -eq 'AzureUSGovernment') {
+            Connect-AzAccount -Identity -Environment AzureUSGovernment -ErrorAction Stop
+        } else {
+            Connect-AzAccount -Identity -ErrorAction Stop
+        }
+        $miConnected = $true
+        Write-Host "Managed identity authentication succeeded." -ForegroundColor Green
+        break
+    } catch {
+        Write-Warning "MI auth attempt $miAttempt failed: $($_.Exception.Message)"
+        if ($miAttempt -eq 20) {
+            Write-Error "FATAL: Connect-AzAccount -Identity failed after 20 attempts. Cannot proceed."
+            Stop-Transcript
+            exit 1
+        }
+        Start-Sleep -Seconds 30
+    }
+}
+
+# Helper function: download files from templateBaseUrl
+# Supports public GitHub raw URLs (no auth) and private Azure Blob Storage (managed identity bearer token)
+# Retries up to 10 times (30s intervals) to handle transient failures
+function Download-ArcBoxArtifact {
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [string]$OutFile
+    )
+    $maxRetries = 10
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            if ($Uri -match 'githubusercontent\.com') {
+                # Public GitHub raw URL - no authentication needed
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            } else {
+                # Private Azure Blob Storage - use managed identity bearer token
+                $token = (Get-AzAccessToken -ResourceUrl 'https://storage.azure.com/' -AsSecureString | ForEach-Object { ConvertFrom-SecureString $_.Token -AsPlainText })
+                $headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2020-04-08' }
+                Invoke-WebRequest -Uri $Uri -Headers $headers -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            }
+            return
+        } catch {
+            $fileName = Split-Path $OutFile -Leaf
+            Write-Warning "Download attempt $attempt/$maxRetries failed for '$fileName': $($_.Exception.Message)"
+            if ($attempt -eq $maxRetries) {
+                Write-Error "FATAL: Failed to download '$fileName' from '$Uri' after $maxRetries attempts."
+                throw
+            }
+            Start-Sleep -Seconds 30
+        }
+    }
+}
+
+# Track download failures
+$script:downloadErrors = @()
+
+# Download PSProfile now that MI auth is available
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/PSProfile.ps1") -OutFile $PsHome\Profile.ps1
+.$PsHome\Profile.ps1
 
 $tags = Get-AzResourceGroup -Name $resourceGroup | Select-Object -ExpandProperty Tags
 
@@ -196,7 +268,8 @@ if ($vmAutologon -eq "true") {
 if ($autoShutdownEnabled -eq "true") {
 
     $ScheduleResource = Get-AzResource -ResourceGroup $resourceGroup -ResourceType Microsoft.DevTestLab/schedules
-    $Uri = "https://management.azure.com$($ScheduleResource.ResourceId)?api-version=2018-09-15"
+    $armEndpoint = if ($azureEnvironment -eq 'AzureUSGovernment') { 'https://management.usgovcloudapi.net' } else { 'https://management.azure.com' }
+    $Uri = "${armEndpoint}$($ScheduleResource.ResourceId)?api-version=2018-09-15"
 
     $Schedule = Invoke-AzRestMethod -Uri $Uri
 
@@ -233,94 +306,152 @@ Write-Header "Fetching GitHub Artifacts"
 # All flavors
 Write-Host "Fetching Artifacts for All Flavors"
 Invoke-WebRequest "https://raw.githubusercontent.com/Azure/arc_jumpstart_docs/main/img/wallpaper/arcbox_wallpaper_dark.png" -OutFile $Env:ArcBoxDir\wallpaper.png
-Invoke-WebRequest ($templateBaseUrl + "artifacts/MonitorWorkbookLogonScript.ps1") -OutFile $Env:ArcBoxDir\MonitorWorkbookLogonScript.ps1
-Invoke-WebRequest ($templateBaseUrl + "artifacts/mgmtMonitorWorkbook.parameters.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.parameters.json
-Invoke-WebRequest ($templateBaseUrl + "artifacts/monitoring/arc-inventory-workbook.json") -OutFile "$Env:ArcBoxDir\arc-inventory-workbook.json"
-Invoke-WebRequest ($templateBaseUrl + "artifacts/monitoring/arc-osperformance-workbook.json") -OutFile "$Env:ArcBoxDir\arc-osperformance-workbook.json"
-Invoke-WebRequest ($templateBaseUrl + "artifacts/DeploymentStatus.ps1") -OutFile $Env:ArcBoxDir\DeploymentStatus.ps1
-Invoke-WebRequest ($templateBaseUrl + "artifacts/LogInstructions.txt") -OutFile $Env:ArcBoxLogsDir\LogInstructions.txt
-Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/common.dsc.yml") -OutFile $Env:ArcBoxDscDir\common.dsc.yml
-Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/virtual_machines_sql.dsc.yml") -OutFile $Env:ArcBoxDscDir\virtual_machines_sql.dsc.yml
-Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/arcbox-bginfo.bgi") -OutFile $Env:ArcBoxTestsDir\arcbox-bginfo.bgi
-Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/common.tests.ps1") -OutFile $Env:ArcBoxTestsDir\common.tests.ps1
-Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/Invoke-Test.ps1") -OutFile $Env:ArcBoxTestsDir\Invoke-Test.ps1
-Invoke-WebRequest ($templateBaseUrl + "artifacts/WinGet.ps1") -OutFile $Env:ArcBoxDir\WinGet.ps1
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/MonitorWorkbookLogonScript.ps1") -OutFile $Env:ArcBoxDir\MonitorWorkbookLogonScript.ps1
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/mgmtMonitorWorkbook.parameters.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.parameters.json
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/monitoring/arc-inventory-workbook.json") -OutFile "$Env:ArcBoxDir\arc-inventory-workbook.json"
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/monitoring/arc-osperformance-workbook.json") -OutFile "$Env:ArcBoxDir\arc-osperformance-workbook.json"
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DeploymentStatus.ps1") -OutFile $Env:ArcBoxDir\DeploymentStatus.ps1
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/LogInstructions.txt") -OutFile $Env:ArcBoxLogsDir\LogInstructions.txt
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/common.dsc.yml") -OutFile $Env:ArcBoxDscDir\common.dsc.yml
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/virtual_machines_sql.dsc.yml") -OutFile $Env:ArcBoxDscDir\virtual_machines_sql.dsc.yml
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/arcbox-bginfo.bgi") -OutFile $Env:ArcBoxTestsDir\arcbox-bginfo.bgi
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/common.tests.ps1") -OutFile $Env:ArcBoxTestsDir\common.tests.ps1
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/Invoke-Test.ps1") -OutFile $Env:ArcBoxTestsDir\Invoke-Test.ps1
+Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/WinGet.ps1") -OutFile $Env:ArcBoxDir\WinGet.ps1
 
 # Workbook template
 if ($flavor -eq "ITPro") {
     Write-Host "Fetching Workbook Template Artifact for ITPro"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookITPro.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookITPro.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
 }
 elseif ($flavor -eq "DevOps") {
     Write-Host "Fetching Workbook Template Artifact for DevOps"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookDevOps.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookDevOps.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
 }
 elseif ($flavor -eq "DataOps") {
     Write-Host "Fetching Workbook Template Artifact for DataOps"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookDataOps.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/mgmtMonitorWorkbookDataOps.json") -OutFile $Env:ArcBoxDir\mgmtMonitorWorkbook.json
 }
 
 # ITPro
 if ($flavor -eq "ITPro") {
     Write-Host "Fetching Artifacts for ITPro Flavor"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/ArcServersLogonScript.ps1") -OutFile $Env:ArcBoxDir\ArcServersLogonScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/installArcAgent.ps1") -OutFile $Env:ArcBoxDir\agentScript\installArcAgent.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/installArcAgentUbuntu.sh") -OutFile $Env:ArcBoxDir\agentScript\installArcAgentUbuntu.sh
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/icons/arcsql.ico") -OutFile $Env:ArcBoxIconDir\arcsql.ico
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/installArcAgentSQLUser.ps1") -OutFile $Env:ArcBoxDir\installArcAgentSQLUser.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/SqlAdvancedThreatProtectionShell.psm1") -OutFile $Env:ArcBoxDir\SqlAdvancedThreatProtectionShell.psm1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/defendersqldcrtemplate.json") -OutFile $Env:ArcBoxDir\defendersqldcrtemplate.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/testDefenderForSQL.ps1") -OutFile $Env:ArcBoxDir\testDefenderForSQL.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/itpro.tests.ps1") -OutFile $Env:ArcBoxTestsDir\itpro.tests.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/itpro.dsc.yml") -OutFile $Env:ArcBoxDscDir\itpro.dsc.yml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/virtual_machines_itpro.dsc.yml") -OutFile $Env:ArcBoxDscDir\virtual_machines_itpro.dsc.yml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/ArcServersLogonScript.ps1") -OutFile $Env:ArcBoxDir\ArcServersLogonScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/installArcAgent.ps1") -OutFile $Env:ArcBoxDir\agentScript\installArcAgent.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/installArcAgentUbuntu.sh") -OutFile $Env:ArcBoxDir\agentScript\installArcAgentUbuntu.sh
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/icons/arcsql.ico") -OutFile $Env:ArcBoxIconDir\arcsql.ico
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/installArcAgentSQLUser.ps1") -OutFile $Env:ArcBoxDir\installArcAgentSQLUser.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/SqlAdvancedThreatProtectionShell.psm1") -OutFile $Env:ArcBoxDir\SqlAdvancedThreatProtectionShell.psm1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/defendersqldcrtemplate.json") -OutFile $Env:ArcBoxDir\defendersqldcrtemplate.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/testDefenderForSQL.ps1") -OutFile $Env:ArcBoxDir\testDefenderForSQL.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/itpro.tests.ps1") -OutFile $Env:ArcBoxTestsDir\itpro.tests.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/itpro.dsc.yml") -OutFile $Env:ArcBoxDscDir\itpro.dsc.yml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/virtual_machines_itpro.dsc.yml") -OutFile $Env:ArcBoxDscDir\virtual_machines_itpro.dsc.yml
 }
 
 # DevOps
 if ($flavor -eq "DevOps") {
     Write-Host "Fetching Artifacts for DevOps Flavor"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DevOpsLogonScript.ps1") -OutFile $Env:ArcBoxDir\DevOpsLogonScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/BookStoreLaunch.ps1") -OutFile $Env:ArcBoxDir\BookStoreLaunch.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/devops_ingress/bookbuyer.yaml") -OutFile $Env:ArcBoxKVDir\bookbuyer.yaml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/devops_ingress/bookstore.yaml") -OutFile $Env:ArcBoxKVDir\bookstore.yaml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/devops_ingress/hello-arc.yaml") -OutFile $Env:ArcBoxKVDir\hello-arc.yaml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/gitops_scripts/K3sGitOps.ps1") -OutFile $Env:ArcBoxGitOpsDir\K3sGitOps.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/gitops_scripts/K3sRBAC.ps1") -OutFile $Env:ArcBoxGitOpsDir\K3sRBAC.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/icons/arc.ico") -OutFile $Env:ArcBoxIconDir\arc.ico
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/icons/bookstore.ico") -OutFile $Env:ArcBoxIconDir\bookstore.ico
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/devops.tests.ps1") -OutFile $Env:ArcBoxTestsDir\devops.tests.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/devops.dsc.yml") -OutFile $Env:ArcBoxDscDir\devops.dsc.yml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/longhorn.yaml") -OutFile $Env:ArcBoxDir\longhorn.yaml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DevOpsLogonScript.ps1") -OutFile $Env:ArcBoxDir\DevOpsLogonScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/BookStoreLaunch.ps1") -OutFile $Env:ArcBoxDir\BookStoreLaunch.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/devops_ingress/bookbuyer.yaml") -OutFile $Env:ArcBoxKVDir\bookbuyer.yaml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/devops_ingress/bookstore.yaml") -OutFile $Env:ArcBoxKVDir\bookstore.yaml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/devops_ingress/hello-arc.yaml") -OutFile $Env:ArcBoxKVDir\hello-arc.yaml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/gitops_scripts/K3sGitOps.ps1") -OutFile $Env:ArcBoxGitOpsDir\K3sGitOps.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/gitops_scripts/K3sRBAC.ps1") -OutFile $Env:ArcBoxGitOpsDir\K3sRBAC.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/icons/arc.ico") -OutFile $Env:ArcBoxIconDir\arc.ico
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/icons/bookstore.ico") -OutFile $Env:ArcBoxIconDir\bookstore.ico
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/devops.tests.ps1") -OutFile $Env:ArcBoxTestsDir\devops.tests.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/devops.dsc.yml") -OutFile $Env:ArcBoxDscDir\devops.dsc.yml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/longhorn.yaml") -OutFile $Env:ArcBoxDir\longhorn.yaml
 }
 
 # DataOps
 if ($flavor -eq "DataOps") {
     Write-Host "Fetching Artifacts for DataOps Flavor"
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/ArcServersLogonScript.ps1") -OutFile $Env:ArcBoxDir\ArcServersLogonScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DataOpsLogonScript.ps1") -OutFile $Env:ArcBoxDir\DataOpsLogonScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/RunAfterClientVMADJoin.ps1") -OutFile $Env:ArcBoxDir\RunAfterClientVMADJoin.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/settingsTemplate.json") -OutFile $Env:ArcBoxDir\settingsTemplate.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DeploySQLMIADAuth.ps1") -OutFile $Env:ArcBoxDir\DeploySQLMIADAuth.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dataController.json") -OutFile $Env:ArcBoxDir\dataController.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dataController.parameters.json") -OutFile $Env:ArcBoxDir\dataController.parameters.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/sqlmiAD.json") -OutFile $Env:ArcBoxDir\sqlmiAD.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/sqlmiAD.parameters.json") -OutFile $Env:ArcBoxDir\sqlmiAD.parameters.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/SQLMIEndpoints.ps1") -OutFile $Env:ArcBoxDir\SQLMIEndpoints.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/ArcServersLogonScript.ps1") -OutFile $Env:ArcBoxDir\ArcServersLogonScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DataOpsLogonScript.ps1") -OutFile $Env:ArcBoxDir\DataOpsLogonScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/RunAfterClientVMADJoin.ps1") -OutFile $Env:ArcBoxDir\RunAfterClientVMADJoin.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/settingsTemplate.json") -OutFile $Env:ArcBoxDir\settingsTemplate.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DeploySQLMIADAuth.ps1") -OutFile $Env:ArcBoxDir\DeploySQLMIADAuth.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dataController.json") -OutFile $Env:ArcBoxDir\dataController.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dataController.parameters.json") -OutFile $Env:ArcBoxDir\dataController.parameters.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/sqlmiAD.json") -OutFile $Env:ArcBoxDir\sqlmiAD.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/sqlmiAD.parameters.json") -OutFile $Env:ArcBoxDir\sqlmiAD.parameters.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/SQLMIEndpoints.ps1") -OutFile $Env:ArcBoxDir\SQLMIEndpoints.ps1
     Invoke-WebRequest "https://github.com/ErikEJ/SqlQueryStress/releases/download/0.9.7.166/SqlQueryStress.exe" -OutFile $Env:ArcBoxDir\SqlQueryStress.exe
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/adConnector.json") -OutFile $Env:ArcBoxDir\adConnector.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/adConnector.parameters.json") -OutFile $Env:ArcBoxDir\adConnector.parameters.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DataOpsAppScript.ps1") -OutFile $Env:ArcBoxDir\DataOpsAppScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/icons/bookstore.ico") -OutFile $Env:ArcBoxIconDir\bookstore.ico
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DataOpsAppDRScript.ps1") -OutFile $Env:ArcBoxDataOpsDir\DataOpsAppDRScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/DataOpsTestAppScript.ps1") -OutFile $Env:ArcBoxDataOpsDir\DataOpsTestAppScript.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/installArcAgent.ps1") -OutFile $Env:ArcBoxDir\agentScript\installArcAgent.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/SqlAdvancedThreatProtectionShell.psm1") -OutFile $Env:ArcBoxDir\SqlAdvancedThreatProtectionShell.psm1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/defendersqldcrtemplate.json") -OutFile $Env:ArcBoxDir\defendersqldcrtemplate.json
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/testDefenderForSQL.ps1") -OutFile $Env:ArcBoxDir\testDefenderForSQL.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/tests/dataops.tests.ps1") -OutFile $Env:ArcBoxTestsDir\dataops.tests.ps1
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/dsc/dataops.dsc.yml") -OutFile $Env:ArcBoxDscDir\dataops.dsc.yml
-    Invoke-WebRequest ($templateBaseUrl + "artifacts/longhorn.yaml") -OutFile $Env:ArcBoxDir\longhorn.yaml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/adConnector.json") -OutFile $Env:ArcBoxDir\adConnector.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/adConnector.parameters.json") -OutFile $Env:ArcBoxDir\adConnector.parameters.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DataOpsAppScript.ps1") -OutFile $Env:ArcBoxDir\DataOpsAppScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/icons/bookstore.ico") -OutFile $Env:ArcBoxIconDir\bookstore.ico
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DataOpsAppDRScript.ps1") -OutFile $Env:ArcBoxDataOpsDir\DataOpsAppDRScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/DataOpsTestAppScript.ps1") -OutFile $Env:ArcBoxDataOpsDir\DataOpsTestAppScript.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/installArcAgent.ps1") -OutFile $Env:ArcBoxDir\agentScript\installArcAgent.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/SqlAdvancedThreatProtectionShell.psm1") -OutFile $Env:ArcBoxDir\SqlAdvancedThreatProtectionShell.psm1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/defendersqldcrtemplate.json") -OutFile $Env:ArcBoxDir\defendersqldcrtemplate.json
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/testDefenderForSQL.ps1") -OutFile $Env:ArcBoxDir\testDefenderForSQL.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/tests/dataops.tests.ps1") -OutFile $Env:ArcBoxTestsDir\dataops.tests.ps1
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/dsc/dataops.dsc.yml") -OutFile $Env:ArcBoxDscDir\dataops.dsc.yml
+    Download-ArcBoxArtifact -Uri ($templateBaseUrl + "artifacts/longhorn.yaml") -OutFile $Env:ArcBoxDir\longhorn.yaml
 }
+
+# -------------------------------------------------------------------
+# Verification gate: confirm all critical files were downloaded
+# If any required file is missing, stop the script immediately.
+# -------------------------------------------------------------------
+Write-Header "Verifying artifact downloads from storage account"
+
+$requiredFiles = @(
+    "$Env:ArcBoxDir\WinGet.ps1",
+    "$Env:ArcBoxDir\DeploymentStatus.ps1",
+    "$Env:ArcBoxDir\MonitorWorkbookLogonScript.ps1",
+    "$Env:ArcBoxDir\mgmtMonitorWorkbook.parameters.json",
+    "$Env:ArcBoxDir\mgmtMonitorWorkbook.json"
+)
+
+if ($flavor -eq "ITPro") {
+    $requiredFiles += @(
+        "$Env:ArcBoxDir\ArcServersLogonScript.ps1",
+        "$Env:ArcBoxDir\agentScript\installArcAgent.ps1",
+        "$Env:ArcBoxDir\agentScript\installArcAgentUbuntu.sh",
+        "$Env:ArcBoxDir\installArcAgentSQLUser.ps1",
+        "$Env:ArcBoxDir\defendersqldcrtemplate.json"
+    )
+}
+if ($flavor -eq "DevOps") {
+    $requiredFiles += @(
+        "$Env:ArcBoxDir\DevOpsLogonScript.ps1",
+        "$Env:ArcBoxDir\BookStoreLaunch.ps1"
+    )
+}
+if ($flavor -eq "DataOps") {
+    $requiredFiles += @(
+        "$Env:ArcBoxDir\ArcServersLogonScript.ps1",
+        "$Env:ArcBoxDir\DataOpsLogonScript.ps1",
+        "$Env:ArcBoxDir\dataController.json"
+    )
+}
+
+$missingFiles = @()
+foreach ($f in $requiredFiles) {
+    if (-not (Test-Path $f)) {
+        $missingFiles += $f
+        Write-Warning "MISSING: $f"
+    } else {
+        Write-Host "  OK: $f"
+    }
+}
+
+if ($missingFiles.Count -gt 0) {
+    Write-Error "FATAL: $($missingFiles.Count) required artifact(s) not found on the VM. The storage account download failed."
+    Write-Error "Missing files:`n$($missingFiles -join "`n")"
+    Write-Error "Bootstrap cannot continue. Check VM managed identity permissions (Storage Blob Data Contributor) on the storage account and ensure artifacts were uploaded."
+    Stop-Transcript
+    exit 1
+}
+
+Write-Host "All $($requiredFiles.Count) required artifacts verified successfully." -ForegroundColor Green
+# -------------------------------------------------------------------
 
 New-Item -path alias:azdata -value 'C:\Program Files (x86)\Microsoft SDKs\Azdata\CLI\wbin\azdata.cmd'
 

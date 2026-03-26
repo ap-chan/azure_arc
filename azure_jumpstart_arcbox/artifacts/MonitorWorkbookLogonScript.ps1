@@ -5,11 +5,18 @@ Start-Transcript -Path $ArcBoxLogsDir\MonitorWorkbookLogonScript.log
 
 # Required for CLI commands
 Write-Header 'Az CLI Login'
+if ($env:azureEnvironment -eq 'AzureUSGovernment') {
+    az cloud set --name AzureUSGovernment
+}
 az login --identity
 az account set -s $env:subscriptionId
 
 Write-Header 'Az PowerShell Login'
-Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId
+if ($env:azureEnvironment -eq 'AzureUSGovernment') {
+    Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId -Environment AzureUSGovernment
+} else {
+    Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId
+}
 
 
 Write-Host "[$(Get-Date -Format t)] INFO: Configuring Azure Monitor Workbook ARM template for $($env:flavor)"

@@ -119,7 +119,8 @@ $body = @"
 	keyType: `"primary`"
 }
 "@
-$generateTokenUrl = 'https://management.azure.com/subscriptions/'+$env:subscriptionId+'/resourceGroups/'+$env:resourceGroup+'/providers/Microsoft.ApiManagement/service/'+$apimName+'/gateways/selfhost/generateToken?api-version=2022-08-01'
+$apimArmEndpoint = if ($env:azureEnvironment -eq 'AzureUSGovernment') { 'https://management.usgovcloudapi.net' } else { 'https://management.azure.com' }
+$generateTokenUrl = "${apimArmEndpoint}/subscriptions/"+$env:subscriptionId+'/resourceGroups/'+$env:resourceGroup+'/providers/Microsoft.ApiManagement/service/'+$apimName+'/gateways/selfhost/generateToken?api-version=2022-08-01'
 $response = Invoke-RestMethod  $generateTokenUrl -Method 'POST' -Headers $headers -Body $body
 
 

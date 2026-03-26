@@ -29,6 +29,9 @@ sed -i '10s/^/export k3sControlPlane=/' vars.sh
 
 export vmName=$3
 
+# Azure Government blob storage suffix
+export blobSuffix="blob.core.usgovcloudapi.net"
+
 # Save the original stdout and stderr
 exec 3>&1 4>&2
 
@@ -166,9 +169,9 @@ if [[ "$k3sControlPlane" == "true" ]]; then
     echo "k3sNodeToken: $(sudo cat /var/lib/rancher/k3s/server/node-token)" >> $k3sClusterNodeConfig
     echo "k3sClusterIp: $publicIp" >> $k3sClusterNodeConfig
     # Copying kubeconfig file to staging storage account
-    azcopy make "https://$stagingStorageAccountName.blob.core.windows.net/$storageContainerName"
-    azcopy cp $localPath "https://$stagingStorageAccountName.blob.core.windows.net/$storageContainerName/config"
-    azcopy cp $k3sClusterNodeConfig "https://$stagingStorageAccountName.blob.core.windows.net/$storageContainerName/k3sClusterNodeConfig.yaml"
+    azcopy make "https://$stagingStorageAccountName.$blobSuffix/$storageContainerName"
+    azcopy cp $localPath "https://$stagingStorageAccountName.$blobSuffix/$storageContainerName/config"
+    azcopy cp $k3sClusterNodeConfig "https://$stagingStorageAccountName.$blobSuffix/$storageContainerName/k3sClusterNodeConfig.yaml"
 
         # Onboard the cluster to Azure Arc
     echo ""
@@ -258,7 +261,7 @@ else
     echo "Downloading k3s control plane details"
     echo ""
     k3sClusterNodeConfigYaml="k3sClusterNodeConfig.yaml"
-    azcopy cp --check-md5 FailIfDifferentOrMissing "https://$stagingStorageAccountName.blob.core.windows.net/$storageContainerName/$k3sClusterNodeConfigYaml" "/home/$adminUsername/$k3sClusterNodeConfigYaml"
+    azcopy cp --check-md5 FailIfDifferentOrMissing "https://$stagingStorageAccountName.$blobSuffix/$storageContainerName/$k3sClusterNodeConfigYaml" "/home/$adminUsername/$k3sClusterNodeConfigYaml"
 
     # Installing Rancher K3s cluster (single worker node)
     echo ""
@@ -282,6 +285,6 @@ echo ""
 exec 1>&3 2>&4 # Further commands will now output to the original stdout and stderr and not the log file
 log="/home/$adminUsername/jumpstart_logs/installK3s-$vmName.log"
 storageContainerNameLower=$(echo $storageContainerName | tr '[:upper:]' '[:lower:]')
-azcopy cp $log "https://$stagingStorageAccountName.blob.core.windows.net/$storageContainerNameLower/installK3s-$vmName.log" --check-length=false >/dev/null 2>&1
+azcopy cp $log "https://$stagingStorageAccountName.$blobSuffix/$storageContainerNameLower/installK3s-$vmName.log" --check-length=false >/dev/null 2>&1
 
 exit 0

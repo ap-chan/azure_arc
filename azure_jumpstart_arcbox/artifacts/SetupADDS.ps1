@@ -27,7 +27,11 @@ foreach ($module in $modules) {
 }
 
 # Connect to Azure using Managed Identity
-Connect-AzAccount -Identity
+if ($env:azureEnvironment -eq 'AzureUSGovernment') {
+    Connect-AzAccount -Identity -Environment AzureUSGovernment
+} else {
+    Connect-AzAccount -Identity
+}
 
 # Get the resource group name from the Azure Instance Metadata Service
 $metadataUrl = "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"

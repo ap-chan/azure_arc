@@ -17,7 +17,13 @@ $resourceGroup = $env:resourceGroup
 $resourceTags = $env:resourceTags
 $namingPrefix = $env:namingPrefix
 
+# Determine ARM endpoint based on Azure environment (Gov vs Commercial)
+$azureEnvironment = $env:azureEnvironment
+$armEndpoint = if ($azureEnvironment -eq 'AzureUSGovernment') { 'https://management.usgovcloudapi.net' } else { 'https://management.azure.com' }
+
 # Moved VHD storage account details here to keep only in place to prevent duplicates.
+# NOTE: The VHD source storage account (jumpstartprodsg) is in public Azure,
+# so the URL always uses blob.core.windows.net regardless of target environment.
 $vhdSourceFolder = 'https://jumpstartprodsg.blob.core.windows.net/arcbox/prod/*'
 
 # Archive existing log file and create new one
@@ -28,6 +34,9 @@ if (Test-Path $logFilePath) {
 }
 
 Start-Transcript -Path $logFilePath -Force -ErrorAction SilentlyContinue
+
+# Refresh PATH to ensure tools installed by WinGet.ps1 (az, azcopy, etc.) are available
+$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
 # Remove registry keys that are used to automatically logon the user (only used for first-time setup)
 $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -123,6 +132,11 @@ if ($Env:flavor -ne 'DevOps') {
         $folder.Attributes += [System.IO.FileAttributes]::Hidden
     }
 
+    # Set Azure CLI cloud before any az commands (must happen before extensions/login)
+    if ($azureEnvironment -eq 'AzureUSGovernment') {
+        az cloud set --name AzureUSGovernment
+    }
+
     # Install Azure CLI extensions
     Write-Header 'Az CLI extensions'
 
@@ -135,11 +149,61 @@ if ($Env:flavor -ne 'DevOps') {
 
     # Required for CLI commands
     Write-Header 'Az CLI Login'
-    az login --identity
-    az account set -s $subscriptionId
+    $maxRetries = 10
+    $retryDelay = 30
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        az login --identity --allow-no-subscriptions 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            az account set -s $subscriptionId
+            Write-Host "Successfully logged in to Azure CLI."
+            break
+        }
+        Write-Host "Azure CLI login attempt $i of $maxRetries failed."
+        if ($i -lt $maxRetries) {
+            Write-Host "Waiting $retryDelay seconds before retrying (role assignments may still be propagating)..."
+            Start-Sleep -Seconds $retryDelay
+        } else {
+            Write-Host "ERROR: Failed to log in to Azure CLI after $maxRetries attempts."
+            Exit 1
+        }
+    }
 
     Write-Header 'Az PowerShell Login'
-    Connect-AzAccount -Identity -Tenant $tenantId -Subscription $subscriptionId
+    $loginSucceeded = $false
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        try {
+            if ($azureEnvironment -eq 'AzureUSGovernment') {
+                Connect-AzAccount -Identity -Environment AzureUSGovernment -Tenant $tenantId -Subscription $subscriptionId -ErrorAction Stop
+            } else {
+                Connect-AzAccount -Identity -Tenant $tenantId -Subscription $subscriptionId -ErrorAction Stop
+            }
+            Set-AzContext -Subscription $subscriptionId -Tenant $tenantId
+            $loginSucceeded = $true
+            Write-Host "Successfully logged in to Azure PowerShell."
+            break
+        } catch {
+            Write-Host "Azure PowerShell login attempt $i of $maxRetries failed: $_"
+            if ($i -lt $maxRetries) {
+                Write-Host "Waiting $retryDelay seconds before retrying (role assignments may still be propagating)..."
+                Start-Sleep -Seconds $retryDelay
+            }
+        }
+    }
+    if (-not $loginSucceeded) {
+        Write-Host "ERROR: Failed to log in to Azure PowerShell after $maxRetries attempts."
+        Exit 1
+    }
+
+    # Helper function: download files from templateBaseUrl using managed identity auth
+    function Download-ArcBoxArtifact {
+        param(
+            [Parameter(Mandatory)] [string]$Uri,
+            [Parameter(Mandatory)] [string]$OutFile
+        )
+        $token = (Get-AzAccessToken -ResourceUrl 'https://storage.azure.com/' -AsSecureString | ForEach-Object { ConvertFrom-SecureString $_.Token -AsPlainText })
+        $headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2020-04-08' }
+        Invoke-WebRequest -Uri $Uri -Headers $headers -OutFile $OutFile
+    }
 
     $DeploymentProgressString = 'Started ArcServersLogonScript'
 
@@ -203,10 +267,14 @@ if ($Env:flavor -ne 'DevOps') {
     # Create the nested VMs if not already created
     Write-Header 'Create Hyper-V VMs'
 
-    # Create the nested SQL VMs
-    $sqlDscConfigurationFile = "$Env:ArcBoxDscDir\virtual_machines_sql.dsc.yml"
-    (Get-Content -Path $sqlDscConfigurationFile) -replace 'namingPrefixStage', $namingPrefix | Set-Content -Path $sqlDscConfigurationFile
-    winget configure --file C:\ArcBox\DSC\virtual_machines_sql.dsc.yml --accept-configuration-agreements --disable-interactivity
+    # Create the nested SQL VM using native Hyper-V cmdlets (replaces HyperVDsc DSC)
+    if (-not (Get-VM -Name $SQLvmName -ErrorAction SilentlyContinue)) {
+        New-VM -Name $SQLvmName -MemoryStartupBytes 6GB -VHDPath $SQLvmvhdPath -SwitchName 'InternalNATSwitch' -Generation 2 -Path 'F:\Virtual Machines'
+        Set-VM -Name $SQLvmName -ProcessorCount 2
+        Get-VMIntegrationService -VMName $SQLvmName -Name 'Guest Service Interface' | Enable-VMIntegrationService
+        Set-VMFirmware -VMName $SQLvmName -EnableSecureBoot On
+        Start-VM -Name $SQLvmName
+    }
 
     # Restarting Windows VM Network Adapters
     Write-Host 'Restarting Network Adapters'
@@ -240,7 +308,7 @@ if ($Env:flavor -ne 'DevOps') {
     Invoke-Command -VMName $SQLvmName -ScriptBlock { New-NetFirewallRule -DisplayName 'Allow SQL Server TCP 1433' -Direction Inbound -Protocol TCP -LocalPort 1433 -Action Allow } -Credential $winCreds
 
     # Download SQL assessment preparation script
-    Invoke-WebRequest ($Env:templateBaseUrl + 'artifacts/prepareSqlServerForAssessment.ps1') -OutFile $nestedVMArcBoxDir\prepareSqlServerForAssessment.ps1
+    Download-ArcBoxArtifact -Uri ($Env:templateBaseUrl + 'artifacts/prepareSqlServerForAssessment.ps1') -OutFile $nestedVMArcBoxDir\prepareSqlServerForAssessment.ps1
     Copy-VMFile $SQLvmName -SourcePath "$Env:ArcBoxDir\prepareSqlServerForAssessment.ps1" -DestinationPath "$nestedVMArcBoxDir\prepareSqlServerForAssessment.ps1" -CreateFullPath -FileSource Host -Force
     Invoke-Command -VMName $SQLvmName -ScriptBlock { powershell -File $Using:nestedVMArcBoxDir\prepareSqlServerForAssessment.ps1 } -Credential $winCreds
 
@@ -335,8 +403,8 @@ if ($Env:flavor -ne 'DevOps') {
 
         # Verify if ArcBox SQL resource is created
         Write-Host "Enabling SQL server best practices assessment.`n"
-        $bpaDeploymentTemplateUrl = "$Env:templateBaseUrl/artifacts/sqlbpa.json"
-        az deployment group create --resource-group $resourceGroup --template-uri $bpaDeploymentTemplateUrl --parameters workspaceName=$Env:workspaceName vmName=$SQLvmName arcSubscriptionId=$subscriptionId
+        Download-ArcBoxArtifact -Uri "$Env:templateBaseUrl/artifacts/sqlbpa.json" -OutFile "$Env:ArcBoxDir\sqlbpa.json"
+        az deployment group create --resource-group $resourceGroup --template-file "$Env:ArcBoxDir\sqlbpa.json" --parameters workspaceName=$Env:workspaceName vmName=$SQLvmName arcSubscriptionId=$subscriptionId
 
         # Run Best practices assessment
         Write-Host "Execute SQL server best practices assessment.`n"
@@ -344,14 +412,14 @@ if ($Env:flavor -ne 'DevOps') {
         # Wait for a minute to finish everyting and run assessment
         Start-Sleep(60)
 
-        $armRestApiEndpoint = "https://management.azure.com/subscriptions/$subscriptionId/resourcegroups/$resourceGroup/providers/Microsoft.HybridCompute/machines/$SQLvmName/extensions/WindowsAgent.SqlServer?api-version=2019-08-02-preview"
+        $armRestApiEndpoint = "${armEndpoint}/subscriptions/$subscriptionId/resourcegroups/$resourceGroup/providers/Microsoft.HybridCompute/machines/$SQLvmName/extensions/WindowsAgent.SqlServer?api-version=2019-08-02-preview"
 
         # Build API request payload
         $worspaceResourceId = "/subscriptions/$subscriptionId/resourcegroups/$resourceGroup/providers/microsoft.operationalinsights/workspaces/$Env:workspaceName".ToLower()
         $sqlExtensionId = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.HybridCompute/machines/$SQLvmName/extensions/WindowsAgent.SqlServer"
-        $sqlbpaPayloadTemplate = "$Env:templateBaseUrl/artifacts/sqlbpa.payload.json"
+        Download-ArcBoxArtifact -Uri "$Env:templateBaseUrl/artifacts/sqlbpa.payload.json" -OutFile "$Env:ArcBoxDir\sqlbpa.payload.json"
         $settingsSaveTime = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $apiPayload = (Invoke-WebRequest -Uri $sqlbpaPayloadTemplate).Content -replace '{{RESOURCEID}}', $sqlExtensionId -replace '{{LOCATION}}', $azureLocation -replace '{{WORKSPACEID}}', $worspaceResourceId -replace '{{SAVETIME}}', $settingsSaveTime
+        $apiPayload = (Get-Content -Path "$Env:ArcBoxDir\sqlbpa.payload.json" -Raw) -replace '{{RESOURCEID}}', $sqlExtensionId -replace '{{LOCATION}}', $azureLocation -replace '{{WORKSPACEID}}', $worspaceResourceId -replace '{{SAVETIME}}', $settingsSaveTime
 
         # Call REST API to run best practices assessment
         $httpResp = Invoke-WebRequest -Method Patch -Uri $armRestApiEndpoint -Body $apiPayload -Headers $headers
@@ -365,10 +433,10 @@ if ($Env:flavor -ne 'DevOps') {
 
     # Run SQL Server Azure Migration Assessment
     Write-Host "Enabling SQL Server Azure Migration Assessment.`n"
-    $migrationApiURL = 'https://management.azure.com/batch?api-version=2020-06-01'
+    $migrationApiURL = "${armEndpoint}/batch?api-version=2020-06-01"
     $assessmentName = (New-Guid).Guid
     $payLoad = @"
-{"requests":[{"httpMethod":"POST","name":"$assessmentName","requestHeaderDetails":{"commandName":"Microsoft_Azure_HybridData_Platform."},"url":"https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$SQLvmName/runMigrationAssessment?api-version=2024-05-01-preview"}]}
+{"requests":[{"httpMethod":"POST","name":"$assessmentName","requestHeaderDetails":{"commandName":"Microsoft_Azure_HybridData_Platform."},"url":"${armEndpoint}/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$SQLvmName/runMigrationAssessment?api-version=2024-05-01-preview"}]}
 "@
 
     $httpResp = Invoke-WebRequest -Method Post -Uri $migrationApiURL -Body $payLoad -Headers $headers
@@ -480,11 +548,24 @@ if ($Env:flavor -ne 'DevOps') {
         # Update disk IOPS and throughput after downloading nested VMs (note: a disk's performance tier can be downgraded only once every 12 hours)
         az disk update --resource-group $env:resourceGroup --name $existingVMDisk.Name --disk-iops-read-write $existingVMDisk.DiskIOPSReadWrite --disk-mbps-read-write $existingVMDisk.DiskMBpsReadWrite
 
-        # Create the nested VMs if not already created
+        # Create the nested VMs using native Hyper-V cmdlets (replaces HyperVDsc DSC)
         Write-Header 'Create Hyper-V VMs'
-        $serversDscConfigurationFile = "$Env:ArcBoxDscDir\virtual_machines_itpro.dsc.yml"
-        (Get-Content -Path $serversDscConfigurationFile) -replace 'namingPrefixStage', $namingPrefix | Set-Content -Path $serversDscConfigurationFile
-        winget configure --file C:\ArcBox\DSC\virtual_machines_itpro.dsc.yml --accept-configuration-agreements --disable-interactivity
+
+        $itproVMs = @(
+            @{ Name = $Win2k22vmName; VhdPath = $Win2k22vmvhdPath; Memory = 4GB; SecureBoot = $true },
+            @{ Name = $Win2k25vmName; VhdPath = $Win2k25vmvhdPath; Memory = 4GB; SecureBoot = $true },
+            @{ Name = $Ubuntu01vmName; VhdPath = $Ubuntu01vmvhdPath; Memory = 4GB; SecureBoot = $false },
+            @{ Name = $Ubuntu02vmName; VhdPath = $Ubuntu02vmvhdPath; Memory = 4GB; SecureBoot = $false }
+        )
+        foreach ($vmConfig in $itproVMs) {
+            if (-not (Get-VM -Name $vmConfig.Name -ErrorAction SilentlyContinue)) {
+                New-VM -Name $vmConfig.Name -MemoryStartupBytes $vmConfig.Memory -VHDPath $vmConfig.VhdPath -SwitchName 'InternalNATSwitch' -Generation 2 -Path 'F:\Virtual Machines'
+                Set-VM -Name $vmConfig.Name -ProcessorCount 2
+                Get-VMIntegrationService -VMName $vmConfig.Name -Name 'Guest Service Interface' | Enable-VMIntegrationService
+                Set-VMFirmware -VMName $vmConfig.Name -EnableSecureBoot ($vmConfig.SecureBoot ? 'On' : 'Off')
+                Start-VM -Name $vmConfig.Name
+            }
+        }
 
     # Configure automatic start & stop action for the nested VMs
     Get-VM | Where-Object {$_.State -eq "Running"} |
@@ -602,10 +683,12 @@ if ($Env:flavor -ne 'DevOps') {
 
         Write-Output 'Activating operating system on Windows VMs...'
 
+        $kmsServer = if ($azureEnvironment -eq 'AzureUSGovernment') { 'kms.core.usgovcloudapi.net' } else { 'kms.core.windows.net' }
+
         Invoke-Command -VMName $Win2k22vmName -ScriptBlock {
 
             cscript C:\Windows\system32\slmgr.vbs -ipk VDYBN-27WPP-V4HQT-9VMD4-VMK7H
-            cscript C:\Windows\system32\slmgr.vbs -skms kms.core.windows.net
+            cscript C:\Windows\system32\slmgr.vbs -skms $using:kmsServer
             cscript C:\Windows\system32\slmgr.vbs -ato
             cscript C:\Windows\system32\slmgr.vbs -dlv
 
@@ -614,7 +697,7 @@ if ($Env:flavor -ne 'DevOps') {
         Invoke-Command -VMName $Win2k25vmName -ScriptBlock {
 
             cscript C:\Windows\system32\slmgr.vbs -ipk D764K-2NDRG-47T6Q-P8T8W-YP6DF
-            cscript C:\Windows\system32\slmgr.vbs -skms kms.core.windows.net
+            cscript C:\Windows\system32\slmgr.vbs -skms $using:kmsServer
             cscript C:\Windows\system32\slmgr.vbs -ato
             cscript C:\Windows\system32\slmgr.vbs -dlv
 
@@ -634,7 +717,12 @@ if ($Env:flavor -ne 'DevOps') {
         $VMs = @("$namingPrefix-SQL", "$namingPrefix-Win2K22", "$namingPrefix-Win2K25")
         $VMs | ForEach-Object -Parallel {
 
-            $null = Connect-AzAccount -Identity -Tenant $using:tenantId -Subscription $using:subscriptionId -Scope Process -WarningAction SilentlyContinue
+            $null = if ($using:azureEnvironment -eq 'AzureUSGovernment') {
+                Connect-AzAccount -Identity -Scope Process -WarningAction SilentlyContinue -Environment AzureUSGovernment
+                Set-AzContext -Subscription $using:subscriptionId -Tenant $using:tenantId
+            } else {
+                Connect-AzAccount -Identity -Tenant $using:tenantId -Subscription $using:subscriptionId -Scope Process -WarningAction SilentlyContinue
+            }
 
             $vm = $PSItem
 
@@ -648,7 +736,12 @@ if ($Env:flavor -ne 'DevOps') {
         Write-Header 'Enabling SSH access and triggering update assessment for Arc-enabled servers'
         $VMs = @("$namingPrefix-SQL", "$namingPrefix-Ubuntu-01", "$namingPrefix-Ubuntu-02", "$namingPrefix-Win2K22", "$namingPrefix-Win2K25")
         $VMs | ForEach-Object -Parallel {
-            $null = Connect-AzAccount -Identity -Tenant $using:tenantId -Subscription $using:subscriptionId -Scope Process -WarningAction SilentlyContinue
+            $null = if ($using:azureEnvironment -eq 'AzureUSGovernment') {
+                Connect-AzAccount -Identity -Scope Process -WarningAction SilentlyContinue -Environment AzureUSGovernment
+                Set-AzContext -Subscription $using:subscriptionId -Tenant $using:tenantId
+            } else {
+                Connect-AzAccount -Identity -Tenant $using:tenantId -Subscription $using:subscriptionId -Scope Process -WarningAction SilentlyContinue
+            }
 
             $vm = $PSItem
             $connectedMachine = Get-AzConnectedMachine -Name $vm -ResourceGroupName $using:resourceGroup -SubscriptionId $using:subscriptionId
@@ -673,7 +766,12 @@ if ($Env:flavor -ne 'DevOps') {
         }
     } elseif ($Env:flavor -eq 'DataOps') {
         Write-Header 'Enabling SSH access to Arc-enabled servers'
-        $null = Connect-AzAccount -Identity -Tenant $tenantId -Subscription $subscriptionId -Scope Process -WarningAction SilentlyContinue
+        $null = if ($azureEnvironment -eq 'AzureUSGovernment') {
+            Connect-AzAccount -Identity -Scope Process -WarningAction SilentlyContinue -Environment AzureUSGovernment
+            Set-AzContext -Subscription $subscriptionId -Tenant $tenantId
+        } else {
+            Connect-AzAccount -Identity -Tenant $tenantId -Subscription $subscriptionId -Scope Process -WarningAction SilentlyContinue
+        }
         $connectedMachine = Get-AzConnectedMachine -Name $SQLvmName -ResourceGroupName $resourceGroup -SubscriptionId $subscriptionId
         $connectedMachineEndpoint = (Invoke-AzRestMethod -Method get -Path "$($connectedMachine.Id)/providers/Microsoft.HybridConnectivity/endpoints/default?api-version=2023-03-15").Content | ConvertFrom-Json
         if (-not ($connectedMachineEndpoint.properties | Where-Object { $_.type -eq 'default' -and $_.provisioningState -eq 'Succeeded' })) {
