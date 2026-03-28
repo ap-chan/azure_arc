@@ -194,15 +194,34 @@ if ($Env:flavor -ne 'DevOps') {
         Exit 1
     }
 
-    # Helper function: download files from templateBaseUrl using managed identity auth
+    # Helper function: download files from templateBaseUrl
+    # Supports public GitHub raw URLs (no auth) and private Azure Blob Storage (managed identity bearer token)
+    # Retries up to 10 times (30s intervals) to handle transient failures
     function Download-ArcBoxArtifact {
         param(
             [Parameter(Mandatory)] [string]$Uri,
             [Parameter(Mandatory)] [string]$OutFile
         )
-        $token = (Get-AzAccessToken -ResourceUrl 'https://storage.azure.com/' -AsSecureString | ForEach-Object { ConvertFrom-SecureString $_.Token -AsPlainText })
-        $headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2020-04-08' }
-        Invoke-WebRequest -Uri $Uri -Headers $headers -OutFile $OutFile
+        $maxRetries = 10
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+                if ($Uri -match 'githubusercontent\.com') {
+                    # Public GitHub raw URL - no authentication needed
+                    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+                } else {
+                    # Private Azure Blob Storage - use managed identity bearer token
+                    $token = (Get-AzAccessToken -ResourceUrl 'https://storage.azure.com/' -AsSecureString | ForEach-Object { ConvertFrom-SecureString $_.Token -AsPlainText })
+                    $headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2020-04-08' }
+                    Invoke-WebRequest -Uri $Uri -Headers $headers -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+                }
+                return
+            } catch {
+                $fileName = Split-Path $OutFile -Leaf
+                Write-Warning "Download attempt $attempt/$maxRetries failed for '$fileName': $($_.Exception.Message)"
+                if ($attempt -eq $maxRetries) { throw }
+                Start-Sleep -Seconds 30
+            }
+        }
     }
 
     $DeploymentProgressString = 'Started ArcServersLogonScript'

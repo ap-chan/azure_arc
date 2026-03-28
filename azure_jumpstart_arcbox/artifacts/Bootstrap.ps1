@@ -663,10 +663,12 @@ else {
     Write-Header "Installing Hyper-V"
 
     # Install Hyper-V and reboot
+    # Use -NoRestart so the unconditional Restart-Computer below owns the restart.
+    # Using -Restart here causes a shutdown-in-progress conflict with that call.
     Write-Host "Installing Hyper-V and restart"
     Enable-WindowsOptionalFeature -Online -FeatureName Containers -All -NoRestart
     Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart
-    Install-WindowsFeature -Name Hyper-V -IncludeAllSubFeature -IncludeManagementTools -Restart
+    Install-WindowsFeature -Name Hyper-V -IncludeAllSubFeature -IncludeManagementTools -NoRestart
 
     }
 
