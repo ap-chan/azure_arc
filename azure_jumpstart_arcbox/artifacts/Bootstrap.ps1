@@ -129,7 +129,12 @@ Resize-Partition -DriveLetter C -Size $(Get-PartitionSupportedSize -DriveLetter 
 # Installing PowerShell Modules
 Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
 
-Install-Module -Name Microsoft.PowerShell.PSResourceGet -Force
+# Trust PSGallery before installing modules. On WS2019 the default PowerShellGet 1.0.0.1
+# ships with PSGallery set to Untrusted, which causes Install-Module to silently fail with
+# 'No match found' even when the module exists. Trusting it first resolves the issue.
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+Install-Module -Name Microsoft.PowerShell.PSResourceGet -Force -AllowClobber
 
 # Pin Az-modules after other modules to avoid version conflicts
 # See: https://github.com/microsoft/azure_arc/issues/3359
