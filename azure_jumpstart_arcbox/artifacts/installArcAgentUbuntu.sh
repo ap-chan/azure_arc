@@ -11,7 +11,7 @@ wget https://aka.ms/azcmagent -O ~/install_linux_azcmagent.sh # 2>/dev/null
 # Install the hybrid agent
 bash ~/install_linux_azcmagent.sh # 2>/dev/null
 
-ArcServerResourceName=$(hostname |sed -e "s/\b\(.\)/\u\1/g")
+ArcServerResourceName=$arcResourceName
 
 # Run connect command
 azcmagent connect --access-token $accessToken --resource-group $resourceGroup --tenant-id $tenantId --location $Azurelocation --subscription-id $subscriptionId --resource-name "${ArcServerResourceName}" --cloud "AzureUSGovernment" --correlation-id "d009f5dd-dba8-4ac7-bac9-b54ef3a6671a"

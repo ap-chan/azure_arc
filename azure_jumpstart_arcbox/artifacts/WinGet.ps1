@@ -32,8 +32,11 @@ $null = Set-AzResource -ResourceName $env:computername -ResourceGroupName $resou
 # Install WinGet PowerShell module (client only, DSC module is deprecated)
 Install-PSResource -Name Microsoft.WinGet.Client -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Version 1.11.460
 
-# Update WinGet package manager to the latest version (running twice due to a known issue regarding WinAppSDK)
-Repair-WinGetPackageManager -AllUsers -Force -Latest -Verbose
+# Update WinGet package manager to the latest version.
+# Run twice: first attempt may fail with "Value cannot be null" due to a known WinAppSDK registration race
+# condition (https://github.com/microsoft/winget-cli/issues/4227). The second attempt succeeds once the
+# runtime is fully registered. ErrorAction SilentlyContinue suppresses the non-fatal first-run error.
+Repair-WinGetPackageManager -AllUsers -Force -Latest -Verbose -ErrorAction SilentlyContinue
 Repair-WinGetPackageManager -AllUsers -Force -Latest -Verbose
 
 # Common WinGet packages (replaces common.dsc.yml)
@@ -81,14 +84,23 @@ switch ($env:flavor) {
 }
 
 # Install all WinGet packages using direct winget install (replaces winget configure DSC)
+# Acceptable (non-error) WinGet exit codes:
+#   0x8A150014 (-1978335212) = APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED
+#   0x8A15002B (-1978335189) = APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
+#     (fired when the installed version is already newer than the winget source entry, e.g. PowerShell 7, Edge)
+$wingetAcceptableExitCodes = @(0, -1978335212, -1978335189)
+
 $allPackages = $commonPackages + $flavorPackages
 foreach ($pkg in $allPackages) {
     Write-Host "Installing WinGet package: $pkg"
     winget install --id $pkg --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -notin $wingetAcceptableExitCodes) {
         Write-Warning "Failed to install $pkg (exit code: $LASTEXITCODE). Retrying..."
         Start-Sleep -Seconds 5
         winget install --id $pkg --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1
+        if ($LASTEXITCODE -notin $wingetAcceptableExitCodes) {
+            Write-Warning "Failed to install $pkg after retry (exit code: $LASTEXITCODE). Continuing..."
+        }
     }
 }
 

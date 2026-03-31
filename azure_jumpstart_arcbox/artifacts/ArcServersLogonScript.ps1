@@ -369,8 +369,8 @@ if ($Env:flavor -ne 'DevOps') {
 
     $retryCount = 0
     do {
-        # Verify if Arc-enabled server and SQL server extensions are installed
-        $sqlExtension = Get-AzConnectedMachine -Name $SQLvmName -ResourceGroupName $resourceGroup | Select-Object -ExpandProperty Resource | Where-Object { $PSItem.Name -eq 'WindowsAgent.SqlServer' }
+        # Verify if Arc-enabled server and SQL server extension is installed
+        $sqlExtension = Get-AzConnectedMachineExtension -ResourceGroupName $resourceGroup -MachineName $SQLvmName -Name 'WindowsAgent.SqlServer' -ErrorAction SilentlyContinue
         if ($sqlExtension -and ($sqlExtension.ProvisioningState -eq 'Succeeded')) {
             # SQL server extension is installed and ready to run SQL BPA
             Write-Host "SQL server extension is installed and ready to run SQL BPA.`n"
@@ -393,8 +393,8 @@ if ($Env:flavor -ne 'DevOps') {
 
     $retryCount = 0
     do {
-        $amaExtension = Get-AzConnectedMachine -Name $SQLvmName -ResourceGroupName $resourceGroup | Select-Object -ExpandProperty Resource | Where-Object { $PSItem.Name -eq 'AzureMonitorWindowsAgent' }
-        if ($amaExtension.StatusCode -eq 0) {
+        $amaExtension = Get-AzConnectedMachineExtension -ResourceGroupName $resourceGroup -MachineName $SQLvmName -Name 'AzureMonitorWindowsAgent' -ErrorAction SilentlyContinue
+        if ($amaExtension -and ($amaExtension.ProvisioningState -eq 'Succeeded')) {
             Write-Host 'Azure Monitoring Agent extension installation complete.'
             break
         } else {
@@ -414,7 +414,7 @@ if ($Env:flavor -ne 'DevOps') {
     $headers = @{'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
 
     # Enable Best practices assessment
-    if ($amaExtension.StatusCode -eq 0) {
+    if ($amaExtension -and ($amaExtension.ProvisioningState -eq 'Succeeded')) {
 
         # Create custom log analytics table for SQL assessment
         Write-Host "Creating Log Analytis workspace table for SQL best practices assessment.`n"
@@ -693,12 +693,16 @@ if ($Env:flavor -ne 'DevOps') {
 
         # Update Linux VM onboarding script connect to Azure Arc, get new token as it might have been expired by the time execution reached this line.
         $accessToken = ConvertFrom-SecureString ((Get-AzAccessToken -AsSecureString).Token) -AsPlainText
-        (Get-Content -Path "$agentScript\installArcAgentUbuntu.sh" -Raw) -replace '\$accessToken', "'$accessToken'" -replace '\$resourceGroup', "'$resourceGroup'" -replace '\$tenantId', "'$Env:tenantId'" -replace '\$azureLocation', "'$Env:azureLocation'" -replace '\$subscriptionId', "'$subscriptionId'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu.sh"
+        # Create per-VM installation scripts with the correct Arc resource name substituted (avoids relying on hostname inside the VM)
+        $baseLinuxScript = (Get-Content -Path "$agentScript\installArcAgentUbuntu.sh" -Raw) -replace '\$accessToken', "'$accessToken'" -replace '\$resourceGroup', "'$resourceGroup'" -replace '\$tenantId', "'$Env:tenantId'" -replace '\$azureLocation', "'$Env:azureLocation'" -replace '\$subscriptionId', "'$subscriptionId'"
+        $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu01vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu01.sh"
+        $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu02vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu02.sh"
 
         # Copy installation script to nested Linux VMs
         Write-Output 'Transferring installation script to nested Linux VMs...'
 
-        Get-VM *Ubuntu* | Copy-VMFile -SourcePath "$agentScript\installArcAgentModifiedUbuntu.sh" -DestinationPath "/home/$nestedLinuxUsername" -FileSource Host -Force
+        Copy-VMFile $Ubuntu01vmName -SourcePath "$agentScript\installArcAgentModifiedUbuntu01.sh" -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" -FileSource Host -Force -CreateFullPath
+        Copy-VMFile $Ubuntu02vmName -SourcePath "$agentScript\installArcAgentModifiedUbuntu02.sh" -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" -FileSource Host -Force -CreateFullPath
 
         Write-Output 'Activating operating system on Windows VMs...'
 
@@ -820,7 +824,13 @@ if ($Env:flavor -ne 'DevOps') {
 
 # Triggering Azure Policy compliance scan
 Write-Header 'Triggering Azure Policy compliance scan'
-Start-AzPolicyComplianceScan -ResourceGroupName $resourceGroup -AsJob
+try {
+    Import-Module Az.PolicyInsights -ErrorAction Stop
+    Start-AzPolicyComplianceScan -ResourceGroupName $resourceGroup -AsJob
+} catch {
+    Write-Host 'Az.PolicyInsights module not available, triggering policy compliance scan via REST API.'
+    $null = Invoke-AzRestMethod -Method POST -Path "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.PolicyInsights/policyStates/latest/triggerEvaluation?api-version=2019-10-01"
+}
 
 #Changing to Jumpstart ArcBox wallpaper
 Write-Header 'Changing wallpaper'
