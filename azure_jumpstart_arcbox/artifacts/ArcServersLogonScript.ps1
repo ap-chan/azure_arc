@@ -633,7 +633,11 @@ if ($Env:flavor -ne 'DevOps') {
 
             Write-Host 'Waiting for the nested Windows VMs to come back online...'
 
-            Get-VM *Win* | Restart-VM -Force
+            # Give Windows time to initiate the graceful reboot from Rename-Computer -Restart
+            # before polling for the heartbeat. Do NOT call Restart-VM -Force here — that
+            # hard-resets the VM while Windows is mid-shutdown, which sets the dirty-boot
+            # flag and causes WinRE (automatic repair screen) on the next boot.
+            Start-Sleep -Seconds 30
             Get-VM *Win* | Wait-VM -For Heartbeat
 
 
@@ -682,9 +686,10 @@ if ($Env:flavor -ne 'DevOps') {
 
         Get-VM *Ubuntu* | Wait-VM -For IPAddress
 
-        Write-Host 'Waiting for the nested Linux VMs to come back online...waiting for 10 seconds'
-
-        Start-Sleep -Seconds 10
+        # Re-fetch IPs after the rename reboot — DHCP may have assigned different addresses.
+        $Ubuntu01VmIp = Get-VM -Name $Ubuntu01vmName | Select-Object -ExpandProperty NetworkAdapters | Select-Object -ExpandProperty IPAddresses | Select-Object -Index 0
+        $Ubuntu02VmIp = Get-VM -Name $Ubuntu02vmName | Select-Object -ExpandProperty NetworkAdapters | Select-Object -ExpandProperty IPAddresses | Select-Object -Index 0
+        Write-Host "Ubuntu VM IPs after reboot — $Ubuntu01vmName: $Ubuntu01VmIp  $Ubuntu02vmName: $Ubuntu02VmIp"
 
         # Copy installation script to nested Windows VMs
         Write-Output 'Transferring installation script to nested Windows VMs...'
@@ -698,32 +703,39 @@ if ($Env:flavor -ne 'DevOps') {
         $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu01vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu01.sh"
         $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu02vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu02.sh"
 
-        # Copy installation script to nested Linux VMs.
-        # Copy-VMFile requires the Hyper-V Guest File Copy service (hv_fcopy_daemon) to be
-        # running inside the guest. On Ubuntu this service can take 1-3 minutes to start
-        # after boot, so retry until it succeeds rather than failing immediately.
+        # Deliver installation scripts to Ubuntu VMs via SSH/PowerShell remoting.
+        # Copy-VMFile is NOT used here because it requires hv_fcopy_daemon inside the guest,
+        # which on Ubuntu starts slowly and unreliably after a reboot. SSH is available sooner
+        # and is already used by Invoke-JSSudoCommand later in this script.
+        # Set-Content on Windows writes CRLF; normalise to LF so bash can execute the script.
         Write-Output 'Transferring installation script to nested Linux VMs...'
-        $linuxCopyJobs = @(
-            @{ VM = $Ubuntu01vmName; Src = "$agentScript\installArcAgentModifiedUbuntu01.sh" },
-            @{ VM = $Ubuntu02vmName; Src = "$agentScript\installArcAgentModifiedUbuntu02.sh" }
+        $ubuntuDeliveries = @(
+            @{ VM = $Ubuntu01vmName; IP = $Ubuntu01VmIp; Src = "$agentScript\installArcAgentModifiedUbuntu01.sh" },
+            @{ VM = $Ubuntu02vmName; IP = $Ubuntu02VmIp; Src = "$agentScript\installArcAgentModifiedUbuntu02.sh" }
         )
-        foreach ($job in $linuxCopyJobs) {
-            $maxCopyAttempts = 20   # 20 x 15s = up to 5 minutes
-            $copySuccess = $false
-            for ($copyAttempt = 1; $copyAttempt -le $maxCopyAttempts; $copyAttempt++) {
+        $destScript = "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh"
+        foreach ($entry in $ubuntuDeliveries) {
+            $scriptContent = (Get-Content -Path $entry.Src -Raw) -replace "`r`n", "`n" -replace "`r", "`n"
+            $maxSshAttempts = 20   # 20 x 15s = up to 5 minutes
+            $delivered = $false
+            for ($sshAttempt = 1; $sshAttempt -le $maxSshAttempts; $sshAttempt++) {
                 try {
-                    Copy-VMFile $job.VM -SourcePath $job.Src `
-                        -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" `
-                        -FileSource Host -Force -CreateFullPath -ErrorAction Stop
-                    Write-Host "  File copied to $($job.VM) (attempt $copyAttempt)." -ForegroundColor Green
-                    $copySuccess = $true
+                    $ubuntuSession = New-PSSession -HostName $entry.IP -KeyFilePath "$Env:USERPROFILE\.ssh\id_rsa" -UserName $nestedLinuxUsername -ErrorAction Stop
+                    Invoke-Command -Session $ubuntuSession -ScriptBlock {
+                        param([string]$content, [string]$path)
+                        [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
+                        & chmod +x $path
+                    } -ArgumentList $scriptContent, $destScript
+                    Remove-PSSession $ubuntuSession -ErrorAction SilentlyContinue
+                    Write-Host "  Script delivered to $($entry.VM) via SSH (attempt $sshAttempt)." -ForegroundColor Green
+                    $delivered = $true
                     break
                 } catch {
-                    if ($copyAttempt -lt $maxCopyAttempts) {
-                        Write-Host "  Copy-VMFile to $($job.VM) not ready yet (attempt $copyAttempt/$maxCopyAttempts): $($_.Exception.Message). Waiting 15 seconds for hv_fcopy_daemon..." -ForegroundColor Yellow
+                    if ($sshAttempt -lt $maxSshAttempts) {
+                        Write-Host "  SSH not ready on $($entry.VM) yet (attempt $sshAttempt/$maxSshAttempts). Waiting 15 seconds..." -ForegroundColor Yellow
                         Start-Sleep -Seconds 15
                     } else {
-                        Write-Warning "Copy-VMFile to $($job.VM) failed after $maxCopyAttempts attempts. Ubuntu Arc onboarding will be skipped for this VM."
+                        Write-Warning "Could not deliver script to $($entry.VM) after $maxSshAttempts attempts. Arc onboarding will be skipped for this VM."
                     }
                 }
             }
