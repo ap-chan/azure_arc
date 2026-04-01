@@ -107,8 +107,27 @@ foreach ($pkg in $allPackages) {
 # Refresh PATH so newly installed tools (az, azcopy, etc.) are available to logon scripts
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
-# Start remaining logon scripts
-Get-ScheduledTask *LogonScript* | Start-ScheduledTask
+# Start remaining logon scripts (explicitly, so each failure is visible)
+Get-ScheduledTask *LogonScript* | Where-Object { $_.TaskName -ne 'WinGetLogonScript' } | ForEach-Object {
+    $taskName = $_.TaskName
+    try {
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        Write-Host "Started scheduled task: $taskName"
+    } catch {
+        Write-Warning "Failed to start scheduled task '$taskName': $($_.Exception.Message)"
+        Write-Warning "Attempting direct process launch for '$taskName'..."
+        $scriptPath = ($_.Actions | Select-Object -ExpandProperty Arguments -First 1) 2>$null
+        if (-not $scriptPath) {
+            $scriptPath = (Get-ScheduledTask -TaskName $taskName).Actions[0].Arguments
+        }
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+            Start-Process pwsh.exe -ArgumentList "-File `"$scriptPath`"" -WindowStyle Normal
+            Write-Host "Launched direct process for: $scriptPath"
+        } else {
+            Write-Warning "Could not determine script path for task '$taskName'. Start it manually."
+        }
+    }
+}
 
 #Cleanup
 Unregister-ScheduledTask -TaskName 'WinGetLogonScript' -Confirm:$false
