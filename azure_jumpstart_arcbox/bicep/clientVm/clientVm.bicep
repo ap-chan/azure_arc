@@ -136,12 +136,7 @@ var bastionName = '${namingPrefix}-Bastion'
 var publicIpAddressName = deployBastion == false ? '${vmName}-PIP' : '${bastionName}-PIP'
 var networkInterfaceName = '${vmName}-NIC'
 var osDiskType = 'Premium_LRS'
-// Bootstrap.ps1 is always fetched directly from the public GitHub fork so that the
-// unauthenticated CSE download works even when templateBaseUrl is a private blob storage URL.
-var bootstrapGithubUrl = 'https://raw.githubusercontent.com/${githubUser}/azure_arc/${githubBranch}/azure_jumpstart_arcbox/artifacts/Bootstrap.ps1'
-var downloadScript = replace('''
-$ErrorActionPreference='Stop';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13;for($i=1;$i -le 30;$i++){try{Invoke-WebRequest -Uri '__URL__' -OutFile Bootstrap.ps1 -UseBasicParsing;if(Test-Path Bootstrap.ps1){break}else{throw 'File not created'}}catch{Write-Warning ('Attempt '+$i+'/30 failed: '+$_);if($i -eq 30){throw 'Failed to download Bootstrap.ps1 after 30 attempts'};Start-Sleep 30}}
-''', '__URL__', bootstrapGithubUrl)
+var bootstrapFileUri = 'https://raw.githubusercontent.com/${githubUser}/azure_arc/${githubBranch}/azure_jumpstart_arcbox/artifacts/Bootstrap.ps1'
 var PublicIPNoBastion = {
   id: publicIpAddress.id
 }
@@ -271,7 +266,10 @@ resource vmBootstrap 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' =
     typeHandlerVersion: '1.10'
     autoUpgradeMinorVersion: true
     protectedSettings: {
-      commandToExecute: 'powershell.exe -ExecutionPolicy Bypass -Command "${downloadScript}" && powershell.exe -ExecutionPolicy Bypass -File Bootstrap.ps1 -adminUsername ${windowsAdminUsername} -tenantId ${tenantId} -spnAuthority ${spnAuthority} -subscriptionId ${subscription().subscriptionId} -resourceGroup ${resourceGroup().name} -azdataUsername ${azdataUsername} -acceptEula ${acceptEula} -registryUsername ${registryUsername} -arcDcName ${arcDcName} -azureLocation ${location} -mssqlmiName ${mssqlmiName} -POSTGRES_NAME ${postgresName} -POSTGRES_WORKER_NODE_COUNT ${postgresWorkerNodeCount} -POSTGRES_DATASIZE ${postgresDatasize} -POSTGRES_SERVICE_TYPE ${postgresServiceType} -stagingStorageAccountName ${stagingStorageAccountName} -workspaceName ${workspaceName} -templateBaseUrl ${templateBaseUrl} -flavor ${flavor} -k3sArcDataClusterName ${k3sArcDataClusterName} -k3sArcClusterName ${k3sArcClusterName} -aksArcClusterName ${aksArcClusterName} -aksdrArcClusterName ${aksdrArcClusterName} -githubUser ${githubUser} -githubBranch ${githubBranch} -vmAutologon ${vmAutologon} -rdpPort ${rdpPort} -addsDomainName ${addsDomainName} -customLocationRPOID ${customLocationRPOID} -resourceTags ${resourceTags} -namingPrefix ${namingPrefix} -debugEnabled ${debugEnabled} -sqlServerEdition ${sqlServerEdition} -autoShutdownEnabled ${autoShutdownEnabled} -azureEnvironment ${azureEnvironment}'
+      fileUris: [
+        bootstrapFileUri
+      ]
+      commandToExecute: 'powershell.exe -ExecutionPolicy Bypass -File Bootstrap.ps1 -adminUsername ${windowsAdminUsername} -tenantId ${tenantId} -spnAuthority ${spnAuthority} -subscriptionId ${subscription().subscriptionId} -resourceGroup ${resourceGroup().name} -azdataUsername ${azdataUsername} -acceptEula ${acceptEula} -registryUsername ${registryUsername} -arcDcName ${arcDcName} -azureLocation ${location} -mssqlmiName ${mssqlmiName} -POSTGRES_NAME ${postgresName} -POSTGRES_WORKER_NODE_COUNT ${postgresWorkerNodeCount} -POSTGRES_DATASIZE ${postgresDatasize} -POSTGRES_SERVICE_TYPE ${postgresServiceType} -stagingStorageAccountName ${stagingStorageAccountName} -workspaceName ${workspaceName} -templateBaseUrl ${templateBaseUrl} -flavor ${flavor} -k3sArcDataClusterName ${k3sArcDataClusterName} -k3sArcClusterName ${k3sArcClusterName} -aksArcClusterName ${aksArcClusterName} -aksdrArcClusterName ${aksdrArcClusterName} -githubUser ${githubUser} -githubBranch ${githubBranch} -vmAutologon ${vmAutologon} -rdpPort ${rdpPort} -addsDomainName ${addsDomainName} -customLocationRPOID ${customLocationRPOID} -resourceTags ${resourceTags} -namingPrefix ${namingPrefix} -debugEnabled ${debugEnabled} -sqlServerEdition ${sqlServerEdition} -autoShutdownEnabled ${autoShutdownEnabled} -azureEnvironment ${azureEnvironment}'
     }
   }
 }
