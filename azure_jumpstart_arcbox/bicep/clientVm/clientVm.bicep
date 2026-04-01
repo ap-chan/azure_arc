@@ -14,8 +14,6 @@ param vmAutologon bool = false
 param rdpPort string = '3389'
 
 @description('Password for Windows account. Password must have 3 of the following: 1 lower case character, 1 upper case character, 1 number, and 1 special character. The value must be between 12 and 123 characters long')
-@minLength(12)
-@maxLength(123)
 @secure()
 param windowsAdminPassword string
 
@@ -52,8 +50,8 @@ param postgresDatasize int = 1024
 @description('Choose how PostgreSQL service is accessed through Kubernetes networking interface')
 param postgresServiceType string = 'LoadBalancer'
 
-@description('Name for the staging storage account using to hold kubeconfig. This value is passed into the template as an output from mgmtStagingStorage.json')
-param stagingStorageAccountName string
+@description('Name for the staging storage account used to hold kubeconfig (DevOps/DataOps flavors only). Not required for ITPro.')
+param stagingStorageAccountName string = ''
 
 @description('Name for the environment Azure Log Analytics workspace')
 param workspaceName string
@@ -111,7 +109,7 @@ param addsDomainName string = 'jumpstart.local'
 param customLocationRPOID string = ''
 
 @description('The SKU of the VMs disk')
-param vmsDiskSku string = 'PremiumV2_LRS'
+param vmsDiskSku string = 'Premium_LRS'
 
 @description('Use this parameter to enable or disable debug mode for the automation scripts on the client VM, effectively configuring PowerShell ErrorActionPreference to Break. Default is false.')
 param debugEnabled bool = false
@@ -122,20 +120,28 @@ param autoShutdownTimezone string = 'UTC' // Timezone for the auto-shutdown
 param autoShutdownEmailRecipient string = ''
 
 @description('The availability zone for the Virtual Machine, public IP, and data disk for the ArcBox client VM')
-@allowed([
-  '1'
-  '2'
-  '3'
-])
-param zones string = '1'
+param zones ('1' | '2' | '3')?
 
 @description('Option to enable spot pricing for the ArcBox Client VM')
 param enableAzureSpotPricing bool = false
+
+@description('Target Azure cloud environment')
+@allowed([
+  'AzureCloud'
+  'AzureUSGovernment'
+])
+param azureEnvironment string = 'AzureCloud'
 
 var bastionName = '${namingPrefix}-Bastion'
 var publicIpAddressName = deployBastion == false ? '${vmName}-PIP' : '${bastionName}-PIP'
 var networkInterfaceName = '${vmName}-NIC'
 var osDiskType = 'Premium_LRS'
+// Bootstrap.ps1 is always fetched directly from the public GitHub fork so that the
+// unauthenticated CSE download works even when templateBaseUrl is a private blob storage URL.
+var bootstrapGithubUrl = 'https://raw.githubusercontent.com/${githubUser}/azure_arc/${githubBranch}/azure_jumpstart_arcbox/artifacts/Bootstrap.ps1'
+var downloadScript = replace('''
+$ErrorActionPreference='Stop';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13;for($i=1;$i -le 30;$i++){try{Invoke-WebRequest -Uri '__URL__' -OutFile Bootstrap.ps1 -UseBasicParsing;if(Test-Path Bootstrap.ps1){break}else{throw 'File not created'}}catch{Write-Warning ('Attempt '+$i+'/30 failed: '+$_);if($i -eq 30){throw 'Failed to download Bootstrap.ps1 after 30 attempts'};Start-Sleep 30}}
+''', '__URL__', bootstrapGithubUrl)
 var PublicIPNoBastion = {
   id: publicIpAddress.id
 }
@@ -161,7 +167,7 @@ resource networkInterface 'Microsoft.Network/networkInterfaces@2024-05-01' = {
 resource publicIpAddress 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (deployBastion == false) {
   name: publicIpAddressName
   location: location
-  zones: [zones]
+  zones: zones == null ? [] : [zones!]
   properties: {
     publicIPAllocationMethod: 'Static'
     publicIPAddressVersion: 'IPv4'
@@ -175,7 +181,7 @@ resource publicIpAddress 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (
 resource vmDisk 'Microsoft.Compute/disks@2024-03-02' = {
   location: location
   name: '${vmName}-VMsDisk'
-  zones: [zones]
+  zones: zones == null ? [] : [zones!]
   sku: {
     name: vmsDiskSku
   }
@@ -185,21 +191,19 @@ resource vmDisk 'Microsoft.Compute/disks@2024-03-02' = {
     }
     diskSizeGB: 256
     burstingEnabled: false
-    diskMBpsReadWrite: 200
-    diskIOPSReadWrite: 5000
   }
 }
 
 resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
   name: vmName
   location: location
-  zones: [zones]
+  zones: zones == null ? [] : [zones!]
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
     hardwareProfile: {
-      vmSize: flavor == 'DevOps' ? 'Standard_B4ms' : flavor == 'DataOps' ? 'Standard_D8s_v5' : 'Standard_D8s_v5'
+      vmSize: flavor == 'DevOps' ? 'Standard_D4as_v6' : flavor == 'DataOps' ? 'Standard_D8ads_v6' : 'Standard_D8ads_v6'
     }
     storageProfile: {
       osDisk: {
@@ -258,16 +262,16 @@ resource vmBootstrap 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' =
   tags: {
     displayName: 'config-bootstrap'
   }
+  dependsOn: [
+    vmRoleAssignment_Storage
+  ]
   properties: {
     publisher: 'Microsoft.Compute'
     type: 'CustomScriptExtension'
     typeHandlerVersion: '1.10'
     autoUpgradeMinorVersion: true
     protectedSettings: {
-      fileUris: [
-        uri(templateBaseUrl, 'artifacts/Bootstrap.ps1')
-      ]
-      commandToExecute: 'powershell.exe -ExecutionPolicy Bypass -File Bootstrap.ps1 -adminUsername ${windowsAdminUsername} -tenantId ${tenantId} -spnAuthority ${spnAuthority} -subscriptionId ${subscription().subscriptionId} -resourceGroup ${resourceGroup().name} -azdataUsername ${azdataUsername} -acceptEula ${acceptEula} -registryUsername ${registryUsername} -arcDcName ${arcDcName} -azureLocation ${location} -mssqlmiName ${mssqlmiName} -POSTGRES_NAME ${postgresName} -POSTGRES_WORKER_NODE_COUNT ${postgresWorkerNodeCount} -POSTGRES_DATASIZE ${postgresDatasize} -POSTGRES_SERVICE_TYPE ${postgresServiceType} -stagingStorageAccountName ${stagingStorageAccountName} -workspaceName ${workspaceName} -templateBaseUrl ${templateBaseUrl} -flavor ${flavor} -k3sArcDataClusterName ${k3sArcDataClusterName} -k3sArcClusterName ${k3sArcClusterName} -aksArcClusterName ${aksArcClusterName} -aksdrArcClusterName ${aksdrArcClusterName} -githubUser ${githubUser} -githubBranch ${githubBranch} -vmAutologon ${vmAutologon} -rdpPort ${rdpPort} -addsDomainName ${addsDomainName} -customLocationRPOID ${customLocationRPOID} -resourceTags ${resourceTags} -namingPrefix ${namingPrefix} -debugEnabled ${debugEnabled} -sqlServerEdition ${sqlServerEdition} -autoShutdownEnabled ${autoShutdownEnabled}'
+      commandToExecute: 'powershell.exe -ExecutionPolicy Bypass -Command "${downloadScript}" && powershell.exe -ExecutionPolicy Bypass -File Bootstrap.ps1 -adminUsername ${windowsAdminUsername} -tenantId ${tenantId} -spnAuthority ${spnAuthority} -subscriptionId ${subscription().subscriptionId} -resourceGroup ${resourceGroup().name} -azdataUsername ${azdataUsername} -acceptEula ${acceptEula} -registryUsername ${registryUsername} -arcDcName ${arcDcName} -azureLocation ${location} -mssqlmiName ${mssqlmiName} -POSTGRES_NAME ${postgresName} -POSTGRES_WORKER_NODE_COUNT ${postgresWorkerNodeCount} -POSTGRES_DATASIZE ${postgresDatasize} -POSTGRES_SERVICE_TYPE ${postgresServiceType} -stagingStorageAccountName ${stagingStorageAccountName} -workspaceName ${workspaceName} -templateBaseUrl ${templateBaseUrl} -flavor ${flavor} -k3sArcDataClusterName ${k3sArcDataClusterName} -k3sArcClusterName ${k3sArcClusterName} -aksArcClusterName ${aksArcClusterName} -aksdrArcClusterName ${aksdrArcClusterName} -githubUser ${githubUser} -githubBranch ${githubBranch} -vmAutologon ${vmAutologon} -rdpPort ${rdpPort} -addsDomainName ${addsDomainName} -customLocationRPOID ${customLocationRPOID} -resourceTags ${resourceTags} -namingPrefix ${namingPrefix} -debugEnabled ${debugEnabled} -sqlServerEdition ${sqlServerEdition} -autoShutdownEnabled ${autoShutdownEnabled} -azureEnvironment ${azureEnvironment}'
     }
   }
 }
