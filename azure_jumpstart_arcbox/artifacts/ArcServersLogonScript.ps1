@@ -698,11 +698,36 @@ if ($Env:flavor -ne 'DevOps') {
         $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu01vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu01.sh"
         $baseLinuxScript -replace '\$arcResourceName', "'$Ubuntu02vmName'" | Set-Content -Path "$agentScript\installArcAgentModifiedUbuntu02.sh"
 
-        # Copy installation script to nested Linux VMs
+        # Copy installation script to nested Linux VMs.
+        # Copy-VMFile requires the Hyper-V Guest File Copy service (hv_fcopy_daemon) to be
+        # running inside the guest. On Ubuntu this service can take 1-3 minutes to start
+        # after boot, so retry until it succeeds rather than failing immediately.
         Write-Output 'Transferring installation script to nested Linux VMs...'
-
-        Copy-VMFile $Ubuntu01vmName -SourcePath "$agentScript\installArcAgentModifiedUbuntu01.sh" -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" -FileSource Host -Force -CreateFullPath
-        Copy-VMFile $Ubuntu02vmName -SourcePath "$agentScript\installArcAgentModifiedUbuntu02.sh" -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" -FileSource Host -Force -CreateFullPath
+        $linuxCopyJobs = @(
+            @{ VM = $Ubuntu01vmName; Src = "$agentScript\installArcAgentModifiedUbuntu01.sh" },
+            @{ VM = $Ubuntu02vmName; Src = "$agentScript\installArcAgentModifiedUbuntu02.sh" }
+        )
+        foreach ($job in $linuxCopyJobs) {
+            $maxCopyAttempts = 20   # 20 x 15s = up to 5 minutes
+            $copySuccess = $false
+            for ($copyAttempt = 1; $copyAttempt -le $maxCopyAttempts; $copyAttempt++) {
+                try {
+                    Copy-VMFile $job.VM -SourcePath $job.Src `
+                        -DestinationPath "/home/$nestedLinuxUsername/installArcAgentModifiedUbuntu.sh" `
+                        -FileSource Host -Force -CreateFullPath -ErrorAction Stop
+                    Write-Host "  File copied to $($job.VM) (attempt $copyAttempt)." -ForegroundColor Green
+                    $copySuccess = $true
+                    break
+                } catch {
+                    if ($copyAttempt -lt $maxCopyAttempts) {
+                        Write-Host "  Copy-VMFile to $($job.VM) not ready yet (attempt $copyAttempt/$maxCopyAttempts): $($_.Exception.Message). Waiting 15 seconds for hv_fcopy_daemon..." -ForegroundColor Yellow
+                        Start-Sleep -Seconds 15
+                    } else {
+                        Write-Warning "Copy-VMFile to $($job.VM) failed after $maxCopyAttempts attempts. Ubuntu Arc onboarding will be skipped for this VM."
+                    }
+                }
+            }
+        }
 
         Write-Output 'Activating operating system on Windows VMs...'
 
