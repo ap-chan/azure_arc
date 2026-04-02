@@ -883,9 +883,20 @@ Write-Header 'Triggering Azure Policy compliance scan'
 try {
     Import-Module Az.PolicyInsights -ErrorAction Stop
     Start-AzPolicyComplianceScan -ResourceGroupName $resourceGroup -AsJob
+    Write-Host 'Azure Policy compliance scan triggered via Az.PolicyInsights module.'
 } catch {
+    # Az.PolicyInsights not installed — fall back to REST API.
+    # Invoke-AzRestMethod -Path uses the ARM base URL from the current Az context,
+    # which is already set to AzureUSGovernment (management.usgovcloudapi.net).
     Write-Host 'Az.PolicyInsights module not available, triggering policy compliance scan via REST API.'
-    $null = Invoke-AzRestMethod -Method POST -Path "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.PolicyInsights/policyStates/latest/triggerEvaluation?api-version=2019-10-01"
+    $policyResult = Invoke-AzRestMethod -Method POST -Path "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.PolicyInsights/policyStates/latest/triggerEvaluation?api-version=2019-10-01" -ErrorAction SilentlyContinue
+    if ($null -eq $policyResult) {
+        Write-Host 'WARNING: Policy compliance scan REST call returned no response (possible auth or endpoint issue).' -ForegroundColor Yellow
+    } elseif ($policyResult.StatusCode -in 200, 202) {
+        Write-Host "Azure Policy compliance scan triggered successfully (HTTP $($policyResult.StatusCode))."
+    } else {
+        Write-Host "WARNING: Policy compliance scan returned HTTP $($policyResult.StatusCode): $($policyResult.Content)" -ForegroundColor Yellow
+    }
 }
 
 #Changing to Jumpstart ArcBox wallpaper

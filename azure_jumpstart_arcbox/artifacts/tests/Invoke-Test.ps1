@@ -1,4 +1,7 @@
-#Requires -Modules @{ ModuleName="Pester"; ModuleVersion="5.6.0"}, @{ ModuleName="Azure.Arc.Jumpstart.Common" }
+#Requires -Modules @{ ModuleName="Pester"; ModuleVersion="5.6.0"}
+
+# Import helper module for wallpaper/BGInfo functions (no version pin - cannot use #Requires without a version)
+Import-Module Azure.Arc.Jumpstart.Common -Force -ErrorAction SilentlyContinue
 
 $Env:ArcBoxDir = "C:\ArcBox"
 $Env:ArcBoxTestsDir = "$Env:ArcBoxDir\Tests"
