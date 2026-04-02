@@ -1,7 +1,8 @@
-#Requires -Modules @{ ModuleName="Pester"; ModuleVersion="5.6.0"}
+#Requires -Modules @{ ModuleName="Pester"; ModuleVersion="5.6.0"}, @{ ModuleName="Azure.Arc.Jumpstart.Common" }
 
 $Env:ArcBoxDir = "C:\ArcBox"
 $Env:ArcBoxTestsDir = "$Env:ArcBoxDir\Tests"
+$Env:ArcBoxLogsDir = "$Env:ArcBoxDir\Logs"
 
 Invoke-Pester -Path "$Env:ArcBoxTestsDir\common.tests.ps1" -Output Detailed -PassThru -OutVariable tests_common
 $tests_passed = $tests_common.Passed.Count
@@ -33,9 +34,20 @@ Write-Output "Adding deployment test results to wallpaper using BGInfo"
 Set-Content "$Env:windir\TEMP\arcbox-tests-succeeded.txt" $tests_passed
 Set-Content "$Env:windir\TEMP\arcbox-tests-failed.txt" $tests_failed
 
-Set-JSDesktopBackground -ImagePath "$Env:ArcBoxDir\wallpaper.bmp"
+# Ensure the PNG-to-BMP conversion is complete for BGInfo to use
+try {
+    if (-not (Test-Path "$Env:ArcBoxDir\wallpaper.bmp")) {
+        Write-Host "Converting wallpaper PNG to BMP format for BGInfo..."
+        Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath "$Env:ArcBoxDir\wallpaper.bmp" -ErrorAction Stop
+    }
+    Set-JSDesktopBackground -ImagePath "$Env:ArcBoxDir\wallpaper.bmp" -ErrorAction Stop
+} catch {
+    Write-Warning "Failed to set wallpaper: $($_.Exception.Message)"
+}
 
-bginfo.exe $Env:ArcBoxTestsDir\arcbox-bginfo.bgi /timer:0 /NOLICPROMPT
+if (Test-Path "$Env:ArcBoxTestsDir\arcbox-bginfo.bgi") {
+    bginfo.exe $Env:ArcBoxTestsDir\arcbox-bginfo.bgi /timer:0 /NOLICPROMPT
+}
 
 $DeploymentStatusPath = "C:\ArcBox\Logs\DeploymentStatus.log"
 

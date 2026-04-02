@@ -1,5 +1,8 @@
 $ErrorActionPreference = $env:ErrorActionPreference
 
+# Import helper module containing wallpaper and common functions
+Import-Module Azure.Arc.Jumpstart.Common -ErrorAction SilentlyContinue
+
 $Env:ArcBoxDir = 'C:\ArcBox'
 $Env:ArcBoxLogsDir = "$Env:ArcBoxDir\Logs"
 $Env:ArcBoxVMDir = 'F:\Virtual Machines'
@@ -196,13 +199,14 @@ if ($Env:flavor -ne 'DevOps') {
 
     # Helper function: download files from templateBaseUrl
     # Supports public GitHub raw URLs (no auth) and private Azure Blob Storage (managed identity bearer token)
-    # Retries up to 10 times (30s intervals) to handle transient failures
+    # Retries up to 15 times with exponential backoff for transient/rate-limiting failures
     function Download-ArcBoxArtifact {
         param(
             [Parameter(Mandatory)] [string]$Uri,
             [Parameter(Mandatory)] [string]$OutFile
         )
-        $maxRetries = 10
+        $maxRetries = 15
+        $baseDelay = 10  # Start with 10 seconds, will exponentially backoff
         for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
             try {
                 if ($Uri -match 'githubusercontent\.com') {
@@ -217,9 +221,20 @@ if ($Env:flavor -ne 'DevOps') {
                 return
             } catch {
                 $fileName = Split-Path $OutFile -Leaf
-                Write-Warning "Download attempt $attempt/$maxRetries failed for '$fileName': $($_.Exception.Message)"
-                if ($attempt -eq $maxRetries) { throw }
-                Start-Sleep -Seconds 30
+                # Check if it's a 429 (Too Many Requests) or other transient error
+                $is429 = $_.Exception.Message -match '429|Too Many Requests'
+                if ($attempt -eq $maxRetries) {
+                    Write-Warning "Download attempt $attempt/$maxRetries (final) failed for '$fileName': $($_.Exception.Message)"
+                    throw
+                }
+                # Calculate exponential backoff: 10s, 20s, 40s, 80s, etc. (capped at 5 minutes)
+                $delaySeconds = [Math]::Min($baseDelay * [Math]::Pow(2, $attempt - 1), 300)
+                if ($is429) {
+                    Write-Warning "Download attempt $attempt/$maxRetries failed for '$fileName' (429 Rate Limit): Waiting $delaySeconds seconds before retry..."
+                } else {
+                    Write-Warning "Download attempt $attempt/$maxRetries failed for '$fileName': $($_.Exception.Message) - Waiting $delaySeconds seconds..."
+                }
+                Start-Sleep -Seconds $delaySeconds
             }
         }
     }
@@ -409,6 +424,10 @@ if ($Env:flavor -ne 'DevOps') {
         }
     } while ($retryCount -le 10)
 
+    # Re-establish Azure CLI subscription context before SQL operations (context may have been lost during nested VM operations)
+    Write-Host "Re-establishing Azure CLI subscription context...`n"
+    az account set --subscription $subscriptionId -ErrorAction Stop 2>&1 | Out-Null
+
     # Get access token to make ARM REST API call for SQL server BPA and migration assessments
     $token = (az account get-access-token --subscription $subscriptionId --query accessToken --output tsv)
     $headers = @{'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
@@ -418,12 +437,12 @@ if ($Env:flavor -ne 'DevOps') {
 
         # Create custom log analytics table for SQL assessment
         Write-Host "Creating Log Analytis workspace table for SQL best practices assessment.`n"
-        az monitor log-analytics workspace table create --resource-group $resourceGroup --workspace-name $Env:workspaceName -n SqlAssessment_CL --columns RawData=string TimeGenerated=datetime --only-show-errors
+        az monitor log-analytics workspace table create --subscription $subscriptionId --resource-group $resourceGroup --workspace-name $Env:workspaceName -n SqlAssessment_CL --columns RawData=string TimeGenerated=datetime --only-show-errors
 
         # Verify if ArcBox SQL resource is created
         Write-Host "Enabling SQL server best practices assessment.`n"
         Download-ArcBoxArtifact -Uri "$Env:templateBaseUrl/artifacts/sqlbpa.json" -OutFile "$Env:ArcBoxDir\sqlbpa.json"
-        az deployment group create --resource-group $resourceGroup --template-file "$Env:ArcBoxDir\sqlbpa.json" --parameters workspaceName=$Env:workspaceName vmName=$SQLvmName arcSubscriptionId=$subscriptionId
+        az deployment group create --subscription $subscriptionId --resource-group $resourceGroup --template-file "$Env:ArcBoxDir\sqlbpa.json" --parameters workspaceName=$Env:workspaceName vmName=$SQLvmName arcSubscriptionId=$subscriptionId
 
         # Run Best practices assessment
         Write-Host "Execute SQL server best practices assessment.`n"

@@ -1,5 +1,8 @@
 $ErrorActionPreference = $env:ErrorActionPreference
 
+# Import helper module containing wallpaper and common functions
+Import-Module Azure.Arc.Jumpstart.Common -ErrorAction SilentlyContinue
+
 $Env:ArcBoxDir = "C:\ArcBox"
 $Env:ArcBoxLogsDir = "C:\ArcBox\Logs"
 $Env:ArcBoxVMDir = "F:\Virtual Machines"
