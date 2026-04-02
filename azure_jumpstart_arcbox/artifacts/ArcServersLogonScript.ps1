@@ -689,7 +689,7 @@ if ($Env:flavor -ne 'DevOps') {
         # Re-fetch IPs after the rename reboot — DHCP may have assigned different addresses.
         $Ubuntu01VmIp = Get-VM -Name $Ubuntu01vmName | Select-Object -ExpandProperty NetworkAdapters | Select-Object -ExpandProperty IPAddresses | Select-Object -Index 0
         $Ubuntu02VmIp = Get-VM -Name $Ubuntu02vmName | Select-Object -ExpandProperty NetworkAdapters | Select-Object -ExpandProperty IPAddresses | Select-Object -Index 0
-        Write-Host "Ubuntu VM IPs after reboot — $Ubuntu01vmName: $Ubuntu01VmIp  $Ubuntu02vmName: $Ubuntu02VmIp"
+        Write-Host "Ubuntu VM IPs after reboot — ${Ubuntu01vmName}: $Ubuntu01VmIp  ${Ubuntu02vmName}: $Ubuntu02VmIp"
 
         # Copy installation script to nested Windows VMs
         Write-Output 'Transferring installation script to nested Windows VMs...'

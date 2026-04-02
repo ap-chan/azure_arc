@@ -119,8 +119,15 @@ New-Item -Path $Env:ArcBoxTestsDir -ItemType directory -Force
 
 Start-Transcript -Path $Env:ArcBoxLogsDir\Bootstrap.log
 
-# Set SyncForegroundPolicy to 1 to ensure that the scheduled task runs after the client VM joins the domain
-Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "SyncForegroundPolicy" 1
+# SyncForegroundPolicy=1 makes Windows wait for GP sync before completing logon.
+# Only DataOps needs this (domain join + GP propagation). ITPro is non-domain: setting
+# it to 1 causes autologon to stall waiting for a domain controller that doesn't exist,
+# which delays or blocks the AtLogOn scheduled tasks (WinGetLogonScript, ArcServersLogonScript).
+if ($flavor -eq "DataOps") {
+    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "SyncForegroundPolicy" 1
+} else {
+    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "SyncForegroundPolicy" 0
+}
 
 # Note: PSProfile.ps1 download moved to after Az login (requires MI auth for private blob storage)
 
