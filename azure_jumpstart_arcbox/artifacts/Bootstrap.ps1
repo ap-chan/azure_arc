@@ -290,7 +290,7 @@ if ($autoShutdownEnabled -eq "true") {
     $ScheduleSettings = $Schedule.Content | ConvertFrom-Json
     $ScheduleSettings.properties.status = "Disabled"
 
-    Invoke-AzRestMethod -Uri $Uri -Method PUT -Payload ($ScheduleSettings | ConvertTo-Json)
+    Invoke-AzRestMethod -Uri $Uri -Method PUT -Payload ($ScheduleSettings | ConvertTo-Json -Depth 5)
 
 }
 

@@ -139,7 +139,7 @@ if (Get-ScheduledTask | Where-Object {$_.TaskName -eq $TaskName}) {
         $ScheduleSettings = $Schedule.Content | ConvertFrom-Json
         $ScheduleSettings.properties.status = "Enabled"
 
-        Invoke-AzRestMethod -Uri $Uri -Method PUT -Payload ($ScheduleSettings | ConvertTo-Json)
+        Invoke-AzRestMethod -Uri $Uri -Method PUT -Payload ($ScheduleSettings | ConvertTo-Json -Depth 5)
 
     } else {
 
