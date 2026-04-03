@@ -402,6 +402,11 @@ if ($Env:flavor -ne 'DevOps') {
         }
     } while ($retryCount -le 10)
 
+    # Register Microsoft.AzureArcData provider - required for SqlServerInstances resource and migration assessment.
+    # Auto-registration via the SQL extension is not reliable; register explicitly with --wait.
+    Write-Host "Registering Microsoft.AzureArcData provider (required for migration assessment).`n"
+    az provider register -n Microsoft.AzureArcData --wait --only-show-errors
+
     # Azure Monitor Agent extension is deployed automatically using Azure Policy. Wait until extension status is Succeded.
     Write-Host "Installing Azure Monitoring Agent extension.`n"
     az connectedmachine extension create --machine-name $SQLvmName --name AzureMonitorWindowsAgent --publisher Microsoft.Azure.Monitor --type AzureMonitorWindowsAgent --resource-group $resourceGroup --location $azureLocation --only-show-errors --no-wait
@@ -471,6 +476,26 @@ if ($Env:flavor -ne 'DevOps') {
 
     # Run SQL Server Azure Migration Assessment
     Write-Host "Enabling SQL Server Azure Migration Assessment.`n"
+
+    # Wait for the SqlServerInstances resource to be created by the SQL extension before calling runMigrationAssessment
+    $sqlInstanceUri = "${armEndpoint}/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$SQLvmName`?api-version=2024-05-01-preview"
+    $retryCount = 0
+    do {
+        try {
+            $null = Invoke-WebRequest -Method Get -Uri $sqlInstanceUri -Headers $headers -ErrorAction Stop
+            Write-Host "SqlServerInstances resource '$SQLvmName' found."
+            break
+        } catch {
+            $retryCount++
+            if ($retryCount -gt 15) {
+                Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
+                break
+            }
+            Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
+            Start-Sleep(30)
+        }
+    } while ($retryCount -le 15)
+
     $migrationApiURL = "${armEndpoint}/batch?api-version=2020-06-01"
     $assessmentName = (New-Guid).Guid
     $payLoad = @"
@@ -485,13 +510,18 @@ if ($Env:flavor -ne 'DevOps') {
         Write-Host 'SQL Server Migration Assessment faild. Please refer troubleshooting guide to run manually.'
     }
 
-    #Install SQLAdvancedThreatProtection solution
-    Write-Host "Installing SQLAdvancedThreatProtection Log Analytics solution.`n"
-    az monitor log-analytics solution create --resource-group $resourceGroup --solution-type SQLAdvancedThreatProtection --workspace $Env:workspaceName --only-show-errors
-
-    #Install SQLVulnerabilityAssessment solution
-    Write-Host "Install SQLVulnerabilityAssessment Log Analytics solution.`n"
-    az monitor log-analytics solution create --resource-group $resourceGroup --solution-type SQLVulnerabilityAssessment --workspace $Env:workspaceName --only-show-errors
+    # Install Log Analytics solutions - check first using the full resource name '{type}({workspace})'
+    # to avoid CannotUpdatePlan errors when the solution was already deployed by the ARM/Bicep mgmtArtifacts template
+    foreach ($solutionType in @('SQLAdvancedThreatProtection', 'SQLVulnerabilityAssessment')) {
+        Write-Host "Installing $solutionType Log Analytics solution.`n"
+        $solutionName = "$solutionType($Env:workspaceName)"
+        $existingSolution = az monitor log-analytics solution show --resource-group $resourceGroup --name $solutionName --query 'name' -o tsv 2>$null
+        if (-not [string]::IsNullOrWhiteSpace($existingSolution)) {
+            Write-Host "$solutionType Log Analytics solution already exists, skipping creation."
+        } else {
+            az monitor log-analytics solution create --resource-group $resourceGroup --solution-type $solutionType --workspace $Env:workspaceName --only-show-errors
+        }
+    }
 
     # Update Azure Monitor data collection rule template with Log Analytics workspace resource ID
     $sqlDefenderDcrFile = "$Env:ArcBoxDir\defendersqldcrtemplate.json"
