@@ -403,9 +403,45 @@ if ($Env:flavor -ne 'DevOps') {
     } while ($retryCount -le 10)
 
     # Register Microsoft.AzureArcData provider - required for SqlServerInstances resource and migration assessment.
-    # Auto-registration via the SQL extension is not reliable; register explicitly with --wait.
-    Write-Host "Registering Microsoft.AzureArcData provider (required for migration assessment).`n"
-    az provider register -n Microsoft.AzureArcData --wait --only-show-errors
+    # The VM managed identity has Owner at RG scope but 'register/action' requires subscription scope.
+    # deploy-clientvm.ps1 pre-registers this provider from the deployer's subscription-level context,
+    # so here we check first and skip if already registered; retry on transient failures.
+    Write-Host "Ensuring Microsoft.AzureArcData provider is registered (required for migration assessment).`n"
+    $arcDataRegistered = $false
+    for ($rpRetry = 1; $rpRetry -le 5; $rpRetry++) {
+        $rpState = (az provider show -n Microsoft.AzureArcData --query 'registrationState' -o tsv 2>$null)
+        if ($rpState -eq 'Registered') {
+            Write-Host "Microsoft.AzureArcData provider is already registered."
+            $arcDataRegistered = $true
+            break
+        }
+        Write-Host "Microsoft.AzureArcData provider state: '$rpState'. Attempting registration (attempt $rpRetry/5)..."
+        $regOut = az provider register -n Microsoft.AzureArcData 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            if ($regOut -match 'AuthorizationFailed') {
+                Write-Host "WARNING: Insufficient permission to register Microsoft.AzureArcData at subscription scope."
+                Write-Host "         Pre-register it from the deployer machine (deploy-clientvm.ps1 now does this automatically)."
+                Write-Host "         Continuing — SqlServerInstances retry loop will wait for the provider to become available."
+                break
+            }
+            Write-Host "Provider registration attempt $rpRetry failed: $regOut. Waiting 15 seconds..."
+            Start-Sleep -Seconds 15
+        } else {
+            # Poll until Registered (up to 5 minutes)
+            for ($poll = 1; $poll -le 20; $poll++) {
+                $rpState = (az provider show -n Microsoft.AzureArcData --query 'registrationState' -o tsv 2>$null)
+                if ($rpState -eq 'Registered') { $arcDataRegistered = $true; break }
+                Write-Host "  Waiting for provider to become Registered (current: $rpState) ... poll $poll/20"
+                Start-Sleep -Seconds 15
+            }
+            if ($arcDataRegistered) { break }
+        }
+    }
+    if ($arcDataRegistered) {
+        Write-Host "Microsoft.AzureArcData provider confirmed Registered."
+    } else {
+        Write-Host "WARNING: Could not confirm Microsoft.AzureArcData is Registered. Migration assessment may fail if the provider is not registered before SqlServerInstances is created."
+    }
 
     # Azure Monitor Agent extension is deployed automatically using Azure Policy. Wait until extension status is Succeded.
     Write-Host "Installing Azure Monitoring Agent extension.`n"
