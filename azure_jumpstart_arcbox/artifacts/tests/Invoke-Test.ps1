@@ -43,7 +43,25 @@ try {
         Write-Host "Converting wallpaper PNG to BMP format for BGInfo..."
         Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath "$Env:ArcBoxDir\wallpaper.bmp" -ErrorAction Stop
     }
-    Set-JSDesktopBackground -ImagePath "$Env:ArcBoxDir\wallpaper.bmp" -ErrorAction Stop
+
+    # Resolve which file Windows is currently configured to use as the wallpaper and replace
+    # its content — the same file-replacement approach used in ArcServersLogonScript.ps1 to
+    # work reliably in Azure Government where SystemParametersInfo may fail silently.
+    $regWallpaper = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper' -ErrorAction SilentlyContinue).Wallpaper
+    $candidatePaths = @(
+        $regWallpaper,
+        'C:\Windows\Web\Wallpaper\Windows\img0.jpg',
+        'C:\Windows\Web\4K\Wallpaper\Windows\img0_3840x2160.jpg'
+    )
+    $targetWallpaperPath = $candidatePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
+    if ($null -eq $targetWallpaperPath) { $targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp" }
+
+    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper'      -Value $targetWallpaperPath
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Value '10'
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Value '0'
+    Set-JSDesktopBackground -ImagePath $targetWallpaperPath -ErrorAction Stop
+    RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
 } catch {
     Write-Warning "Failed to set wallpaper: $($_.Exception.Message)"
 }

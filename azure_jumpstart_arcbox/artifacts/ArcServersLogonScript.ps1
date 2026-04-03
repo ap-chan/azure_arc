@@ -544,6 +544,17 @@ if ($Env:flavor -ne 'DevOps') {
     Copy-VMFile $SQLvmName -SourcePath "$Env:ArcBoxDir\testDefenderForSQL.ps1" -DestinationPath $remoteScriptFileFile -CreateFullPath -FileSource Host -Force
     Invoke-Command -VMName $SQLvmName -ScriptBlock { powershell -File $Using:remoteScriptFileFile } -Credential $winCreds
 
+    # Pre-install the arcdata CLI extension explicitly to avoid pip auto-install failures
+    # (az sql server-arc subcommands require arcdata; dynamic pip install fails in restricted/gov environments)
+    Write-Host "Installing arcdata Azure CLI extension.`n"
+    az config set extension.dynamic_install_allow_preview=true 2>&1 | Out-Null
+    $arcdataInstalled = az extension show --name arcdata --query 'name' -o tsv 2>$null
+    if ([string]::IsNullOrWhiteSpace($arcdataInstalled)) {
+        az extension add --name arcdata --allow-preview true --only-show-errors
+    } else {
+        Write-Host "arcdata extension already installed."
+    }
+
     # Enable least privileged access
     Write-Host "Enabling Arc-enabled SQL server least privileged access.`n"
     az sql server-arc extension feature-flag set --name LeastPrivilege --enable true --resource-group $resourceGroup --machine-name $SQLvmName
@@ -935,7 +946,51 @@ Write-Header 'Changing wallpaper'
 # bmp file is required for BGInfo
 Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath "$Env:ArcBoxDir\wallpaper.bmp"
 
-Set-JSDesktopBackground -ImagePath "$Env:ArcBoxDir\wallpaper.bmp"
+# Azure Government-compatible wallpaper deployment.
+# SystemParametersInfo (used by Set-JSDesktopBackground) can fail silently when the user
+# shell is not yet fully initialised during a logon script, or when Group Policy enforces the
+# wallpaper path.  The reliable workaround is to replace the content of the file Windows is
+# ALREADY configured to use as wallpaper, then force a display refresh so no registry path
+# change is needed — bypassing any "prevent changing desktop background" policy.
+
+$regPath      = 'HKCU:\Control Panel\Desktop'
+$regWallpaper = (Get-ItemProperty -Path $regPath -Name 'Wallpaper' -ErrorAction SilentlyContinue).Wallpaper
+
+# Resolve which file to replace: prefer the registry-configured path, fall back to the
+# Windows default light/dark wallpaper locations used in Azure VMs.
+$candidatePaths = @(
+    $regWallpaper,
+    'C:\Windows\Web\Wallpaper\Windows\img0.jpg',
+    'C:\Windows\Web\4K\Wallpaper\Windows\img0_3840x2160.jpg'
+)
+$targetWallpaperPath = $candidatePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
+
+if ($null -ne $targetWallpaperPath) {
+    # Back up the original file so it can be restored if needed
+    $backupPath = "$targetWallpaperPath.bak"
+    if (-not (Test-Path $backupPath)) {
+        Copy-Item -Path $targetWallpaperPath -Destination $backupPath -Force -ErrorAction SilentlyContinue
+        Write-Host "Backed up original wallpaper: $targetWallpaperPath -> $backupPath"
+    }
+    # Replace the file content with the ArcBox wallpaper BMP
+    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force
+    Write-Host "Replaced wallpaper file: $targetWallpaperPath"
+} else {
+    Write-Host "No existing wallpaper file found to replace; using ArcBox wallpaper path directly."
+    $targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp"
+}
+
+# Ensure HKCU registry points at the target file with Fill (style 10) scaling
+Set-ItemProperty -Path $regPath -Name 'Wallpaper'      -Value $targetWallpaperPath
+Set-ItemProperty -Path $regPath -Name 'WallpaperStyle' -Value '10'   # 10 = Fill
+Set-ItemProperty -Path $regPath -Name 'TileWallpaper'  -Value '0'
+
+# Also apply via Win32 API for the current interactive session (works when shell is ready)
+Set-JSDesktopBackground -ImagePath $targetWallpaperPath
+
+# Force the desktop to reload the wallpaper file from disk
+RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
+Write-Host 'Wallpaper applied successfully.'
 
 if ($Env:flavor -eq 'ITPro') {
 
