@@ -13,7 +13,7 @@ BeforeDiscovery {
     $drPartners = @("k3s-sql", "aks-dr-sql")
     $VMs = @("$namingPrefix-sql")
 
-    $null = Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId
+    $null = Connect-AzAccount -Identity -Tenant $env:tenantId -Subscription $env:subscriptionId -Environment ($env:azureEnvironment ?? 'AzureCloud')
     az config set extension.use_dynamic_install=yes_without_prompt
 }
 
