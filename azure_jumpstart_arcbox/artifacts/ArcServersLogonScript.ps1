@@ -594,13 +594,20 @@ if ($Env:flavor -ne 'DevOps') {
         # "Pip failed with status code 2" because pip cannot reach PyPI or hits SSL issues.
         # Workaround: download the wheel via PowerShell (uses system TLS/proxy settings),
         # then install from the local file — pip does not need outbound network access for a local wheel.
-        $arcdataWhlPath = Join-Path $Env:TEMP 'arcdata.whl'
+        # IMPORTANT: the wheel MUST be saved with its original filename (e.g. arcdata-1.2.3-py3-none-any.whl).
+        # Azure CLI parses the extension name from the wheel filename; renaming it to 'arcdata.whl'
+        # produces "Unable to determine extension name" and the install silently does nothing.
+        $arcdataWhlPath = $null
         try {
             Write-Host "  Fetching arcdata wheel URL from Azure CLI extension index..."
             $cliIndex = (Invoke-WebRequest -Uri 'https://aka.ms/azure-cli-extension-index-v1' -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
             $arcdataEntry = $cliIndex.extensions.arcdata | Select-Object -Last 1
             if (-not $arcdataEntry -or -not $arcdataEntry.downloadUrl) { throw "arcdata not found in extension index." }
-            Write-Host "  Downloading arcdata wheel from $($arcdataEntry.downloadUrl)..."
+            # Preserve the original wheel filename so the CLI can extract the extension name from it
+            $arcdataWhlFilename = ($arcdataEntry.downloadUrl -split '[/?#]' | Where-Object { $_ -match '\.whl$' } | Select-Object -Last 1)
+            if (-not $arcdataWhlFilename) { $arcdataWhlFilename = 'arcdata-latest-py2.py3-none-any.whl' }
+            $arcdataWhlPath = Join-Path $Env:TEMP $arcdataWhlFilename
+            Write-Host "  Downloading arcdata wheel from $($arcdataEntry.downloadUrl) -> $arcdataWhlFilename ..."
             Invoke-WebRequest -Uri $arcdataEntry.downloadUrl -OutFile $arcdataWhlPath -UseBasicParsing -ErrorAction Stop
             Write-Host "  Installing arcdata from local wheel..."
             az extension add --source $arcdataWhlPath --yes --only-show-errors
@@ -609,7 +616,7 @@ if ($Env:flavor -ne 'DevOps') {
             Write-Warning "Wheel-based arcdata install failed: $_. Falling back to direct install..."
             az extension add --name arcdata --allow-preview true --only-show-errors
         } finally {
-            Remove-Item $arcdataWhlPath -Force -ErrorAction SilentlyContinue
+            if ($arcdataWhlPath) { Remove-Item $arcdataWhlPath -Force -ErrorAction SilentlyContinue }
         }
     } else {
         Write-Host "arcdata extension already installed."
@@ -1004,71 +1011,61 @@ try {
 Write-Header 'Changing wallpaper'
 
 # bmp file is required for BGInfo
-Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath "$Env:ArcBoxDir\wallpaper.bmp"
+$wallpaperBmpPath = "$Env:ArcBoxDir\wallpaper.bmp"
+Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath $wallpaperBmpPath
 
-# Azure Government-compatible wallpaper deployment.
-# SystemParametersInfo (used by Set-JSDesktopBackground) can fail silently when the user
-# shell is not yet fully initialised during a logon script, or when Group Policy enforces the
-# wallpaper path.  The reliable workaround is to replace the content of the file Windows is
-# ALREADY configured to use as wallpaper, then force a display refresh so no registry path
-# change is needed — bypassing any "prevent changing desktop background" policy.
+# -----------------------------------------------------------------------
+# Wallpaper strategy: HKLM PersonalizationCSP (all users, all sessions).
+#
+# HKCU / SystemParametersInfo / RUNDLL32 only affect the window station of
+# the calling process. A scheduled task running in a non-interactive session
+# cannot update the visible foreground desktop via those mechanisms — they
+# appear to succeed but Explorer ignores them. The PersonalizationCSP HKLM
+# key is the MDM-equivalent approach: Windows reads it at every user logon
+# and enforces it over any per-user HKCU setting, so it applies to all users
+# (including arcdemo) and survives reboots.
+# -----------------------------------------------------------------------
 
-$regPath      = 'HKCU:\Control Panel\Desktop'
-$regWallpaper = (Get-ItemProperty -Path $regPath -Name 'Wallpaper' -ErrorAction SilentlyContinue).Wallpaper
+# 1. Set system-wide via PersonalizationCSP — all users, survives reboot
+$cspPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP'
+if (-not (Test-Path $cspPath)) { New-Item -Path $cspPath -Force | Out-Null }
+Set-ItemProperty -Path $cspPath -Name 'DesktopImageUrl'    -Value $wallpaperBmpPath -Type String -Force
+Set-ItemProperty -Path $cspPath -Name 'DesktopImageStatus' -Value 1                -Type DWord  -Force
+Write-Host "PersonalizationCSP wallpaper configured (all users): $wallpaperBmpPath"
 
-# Resolve which file to replace: prefer the registry-configured path, fall back to the
-# Windows default light/dark wallpaper locations used in Azure VMs.
-$candidatePaths = @(
-    $regWallpaper,
-    'C:\Windows\Web\Wallpaper\Windows\img0.jpg',
-    'C:\Windows\Web\4K\Wallpaper\Windows\img0_3840x2160.jpg'
-)
-$targetWallpaperPath = $candidatePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
-
-if ($null -ne $targetWallpaperPath) {
-    # Back up the original file so it can be restored if needed
-    $backupPath = "$targetWallpaperPath.bak"
-    if (-not (Test-Path $backupPath)) {
-        Copy-Item -Path $targetWallpaperPath -Destination $backupPath -Force -ErrorAction SilentlyContinue
-        Write-Host "Backed up original wallpaper: $targetWallpaperPath -> $backupPath"
-    }
-    # Replace the file content with the ArcBox wallpaper BMP.
-    # Files under C:\Windows\Web\Wallpaper\ are owned by TrustedInstaller; Administrators
-    # cannot overwrite them without first taking ownership and granting write access.
-    & takeown.exe /f $targetWallpaperPath /a 2>&1 | Out-Null
-    & icacls.exe $targetWallpaperPath /grant 'Administrators:F' 2>&1 | Out-Null
-    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force -ErrorAction Stop
-    Write-Host "Replaced wallpaper file: $targetWallpaperPath"
-} else {
-    Write-Host "No existing wallpaper file found to replace; using ArcBox wallpaper path directly."
+# 2. Set wallpaper in the Default User hive so any future new accounts inherit it
+$mountKey = 'HKU\TempDefaultUser'
+try {
+    & reg.exe load $mountKey 'C:\Users\Default\NTUSER.DAT' 2>&1 | Out-Null
+    $defDesktop = "Registry::$mountKey\Control Panel\Desktop"
+    if (-not (Test-Path $defDesktop)) { New-Item -Path $defDesktop -Force | Out-Null }
+    Set-ItemProperty -Path $defDesktop -Name 'Wallpaper'      -Value $wallpaperBmpPath -Force
+    Set-ItemProperty -Path $defDesktop -Name 'WallpaperStyle' -Value '10'              -Force
+    Set-ItemProperty -Path $defDesktop -Name 'TileWallpaper'  -Value '0'               -Force
+    Write-Host "Default User hive wallpaper set."
+} catch {
+    Write-Host "Default User hive update skipped: $_"
+} finally {
+    # Must release handles before unloading or reg.exe returns error 5
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    & reg.exe unload $mountKey 2>&1 | Out-Null
 }
 
-# Always point the live-display registry and SPI calls directly at wallpaper.bmp.
-# Reason: img0.jpg may have been replaced with BMP data above (for group-policy bypass),
-# but calling SystemParametersInfo with a .jpg-extension file containing BMP data can
-# confuse the shell's wallpaper cache, preventing an immediate visual refresh.
-# Using the real .bmp path avoids format-mismatch and works in Azure Government VMs.
-$targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp"
-
-# Clear any HKCU Group Policy wallpaper override so the registry setting below takes effect.
-# In Azure Government VMs, a policy key in HKCU:\Software\Policies\... can override the
-# standard HKCU:\Control Panel\Desktop\Wallpaper key, causing Set-JSDesktopBackground to
-# appear to succeed while Explorer ignores the change.
+# 3. Also apply for the current user (arcdemo) via HKCU + SystemParametersInfo
+#    so the change takes effect in the interactive session without requiring a logoff.
+#    Clear any HKCU Group Policy override that would block it.
+$regPath = 'HKCU:\Control Panel\Desktop'
 $hkcuPolicyPath = 'HKCU:\Software\Policies\Microsoft\Windows\Personalization'
 if (Test-Path $hkcuPolicyPath) {
-    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaper'              -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaperStyle'         -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaper'               -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaperStyle'          -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $hkcuPolicyPath -Name 'PreventChangingWallPaper' -ErrorAction SilentlyContinue
     Write-Host "Cleared HKCU Group Policy wallpaper overrides."
 }
-
-# Ensure HKCU registry points at the BMP with Fill (style 10) scaling
-Set-ItemProperty -Path $regPath -Name 'Wallpaper'      -Value $targetWallpaperPath
+Set-ItemProperty -Path $regPath -Name 'Wallpaper'      -Value $wallpaperBmpPath
 Set-ItemProperty -Path $regPath -Name 'WallpaperStyle' -Value '10'   # 10 = Fill
 Set-ItemProperty -Path $regPath -Name 'TileWallpaper'  -Value '0'
 
-# Apply via Win32 SystemParametersInfo directly (P/Invoke is more reliable than RUNDLL32
-# from a scheduled task context in Azure Government sessions).
 try {
     Add-Type -TypeDefinition @'
 using System;
@@ -1079,13 +1076,11 @@ public class WallpaperHelper {
 }
 '@ -ErrorAction SilentlyContinue
     # SPI_SETDESKWALLPAPER=20, SPIF_UPDATEINIFILE|SPIF_SENDWININICHANGE=3
-    [WallpaperHelper]::SystemParametersInfo(20, 0, $targetWallpaperPath, 3) | Out-Null
+    [WallpaperHelper]::SystemParametersInfo(20, 0, $wallpaperBmpPath, 3) | Out-Null
 } catch {
     Write-Host "P/Invoke wallpaper set skipped: $_"
 }
-
-# Also apply via the helper module function and force a desktop reload
-Set-JSDesktopBackground -ImagePath $targetWallpaperPath
+Set-JSDesktopBackground -ImagePath $wallpaperBmpPath
 RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
 Write-Host 'Wallpaper applied successfully.'
 
