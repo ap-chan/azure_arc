@@ -551,7 +551,7 @@ if ($Env:flavor -ne 'DevOps') {
     foreach ($solutionType in @('SQLAdvancedThreatProtection', 'SQLVulnerabilityAssessment')) {
         Write-Host "Installing $solutionType Log Analytics solution.`n"
         $solutionName = "$solutionType($Env:workspaceName)"
-        $existingSolution = az monitor log-analytics solution show --resource-group $resourceGroup --name $solutionName --query 'name' -o tsv 2>$null
+        $existingSolution = az monitor log-analytics solution show --resource-group $resourceGroup --name $solutionName 2>$null
         if (-not [string]::IsNullOrWhiteSpace($existingSolution)) {
             Write-Host "$solutionType Log Analytics solution already exists, skipping creation."
         } else {
@@ -586,7 +586,27 @@ if ($Env:flavor -ne 'DevOps') {
     az config set extension.dynamic_install_allow_preview=true 2>&1 | Out-Null
     $arcdataInstalled = az extension show --name arcdata --query 'name' -o tsv 2>$null
     if ([string]::IsNullOrWhiteSpace($arcdataInstalled)) {
-        az extension add --name arcdata --allow-preview true --only-show-errors
+        # In restricted/gov environments, 'az extension add --name arcdata' fails with
+        # "Pip failed with status code 2" because pip cannot reach PyPI or hits SSL issues.
+        # Workaround: download the wheel via PowerShell (uses system TLS/proxy settings),
+        # then install from the local file — pip does not need outbound network access for a local wheel.
+        $arcdataWhlPath = Join-Path $Env:TEMP 'arcdata.whl'
+        try {
+            Write-Host "  Fetching arcdata wheel URL from Azure CLI extension index..."
+            $cliIndex = (Invoke-WebRequest -Uri 'https://aka.ms/azure-cli-extension-index-v1' -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
+            $arcdataEntry = $cliIndex.extensions.arcdata | Select-Object -Last 1
+            if (-not $arcdataEntry -or -not $arcdataEntry.downloadUrl) { throw "arcdata not found in extension index." }
+            Write-Host "  Downloading arcdata wheel from $($arcdataEntry.downloadUrl)..."
+            Invoke-WebRequest -Uri $arcdataEntry.downloadUrl -OutFile $arcdataWhlPath -UseBasicParsing -ErrorAction Stop
+            Write-Host "  Installing arcdata from local wheel..."
+            az extension add --source $arcdataWhlPath --yes --only-show-errors
+            Write-Host "arcdata extension installed successfully."
+        } catch {
+            Write-Warning "Wheel-based arcdata install failed: $_. Falling back to direct install..."
+            az extension add --name arcdata --allow-preview true --only-show-errors
+        } finally {
+            Remove-Item $arcdataWhlPath -Force -ErrorAction SilentlyContinue
+        }
     } else {
         Write-Host "arcdata extension already installed."
     }
@@ -1008,8 +1028,12 @@ if ($null -ne $targetWallpaperPath) {
         Copy-Item -Path $targetWallpaperPath -Destination $backupPath -Force -ErrorAction SilentlyContinue
         Write-Host "Backed up original wallpaper: $targetWallpaperPath -> $backupPath"
     }
-    # Replace the file content with the ArcBox wallpaper BMP
-    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force
+    # Replace the file content with the ArcBox wallpaper BMP.
+    # Files under C:\Windows\Web\Wallpaper\ are owned by TrustedInstaller; Administrators
+    # cannot overwrite them without first taking ownership and granting write access.
+    & takeown.exe /f $targetWallpaperPath /a 2>&1 | Out-Null
+    & icacls.exe $targetWallpaperPath /grant 'Administrators:F' 2>&1 | Out-Null
+    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force -ErrorAction Stop
     Write-Host "Replaced wallpaper file: $targetWallpaperPath"
 } else {
     Write-Host "No existing wallpaper file found to replace; using ArcBox wallpaper path directly."
