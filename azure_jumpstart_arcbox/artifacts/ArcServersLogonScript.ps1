@@ -547,12 +547,14 @@ if ($Env:flavor -ne 'DevOps') {
     }
 
     # Install Log Analytics solutions - check first using the full resource name '{type}({workspace})'
-    # to avoid CannotUpdatePlan errors when the solution was already deployed by the ARM/Bicep mgmtArtifacts template
+    # to avoid CannotUpdatePlan errors when the solution was already deployed by the ARM/Bicep mgmtArtifacts template.
+    # Use $LASTEXITCODE to detect existence — az monitor log-analytics solution show writes error text to stdout
+    # in Azure Government, making a string-based check unreliable.
     foreach ($solutionType in @('SQLAdvancedThreatProtection', 'SQLVulnerabilityAssessment')) {
         Write-Host "Installing $solutionType Log Analytics solution.`n"
         $solutionName = "$solutionType($Env:workspaceName)"
-        $existingSolution = az monitor log-analytics solution show --resource-group $resourceGroup --name $solutionName 2>$null
-        if (-not [string]::IsNullOrWhiteSpace($existingSolution)) {
+        az monitor log-analytics solution show --resource-group $resourceGroup --name $solutionName 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
             Write-Host "$solutionType Log Analytics solution already exists, skipping creation."
         } else {
             az monitor log-analytics solution create --resource-group $resourceGroup --solution-type $solutionType --workspace $Env:workspaceName --only-show-errors
@@ -584,8 +586,10 @@ if ($Env:flavor -ne 'DevOps') {
     # (az sql server-arc subcommands require arcdata; dynamic pip install fails in restricted/gov environments)
     Write-Host "Installing arcdata Azure CLI extension.`n"
     az config set extension.dynamic_install_allow_preview=true 2>&1 | Out-Null
-    $arcdataInstalled = az extension show --name arcdata --query 'name' -o tsv 2>$null
-    if ([string]::IsNullOrWhiteSpace($arcdataInstalled)) {
+    # Use $LASTEXITCODE to check — az extension show writes 'ERROR: ...' to stdout (not just stderr)
+    # in some CLI versions, making a string-based check produce false positives in the transcript.
+    az extension show --name arcdata 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
         # In restricted/gov environments, 'az extension add --name arcdata' fails with
         # "Pip failed with status code 2" because pip cannot reach PyPI or hits SSL issues.
         # Workaround: download the wheel via PowerShell (uses system TLS/proxy settings),
@@ -1037,18 +1041,51 @@ if ($null -ne $targetWallpaperPath) {
     Write-Host "Replaced wallpaper file: $targetWallpaperPath"
 } else {
     Write-Host "No existing wallpaper file found to replace; using ArcBox wallpaper path directly."
-    $targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp"
 }
 
-# Ensure HKCU registry points at the target file with Fill (style 10) scaling
+# Always point the live-display registry and SPI calls directly at wallpaper.bmp.
+# Reason: img0.jpg may have been replaced with BMP data above (for group-policy bypass),
+# but calling SystemParametersInfo with a .jpg-extension file containing BMP data can
+# confuse the shell's wallpaper cache, preventing an immediate visual refresh.
+# Using the real .bmp path avoids format-mismatch and works in Azure Government VMs.
+$targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp"
+
+# Clear any HKCU Group Policy wallpaper override so the registry setting below takes effect.
+# In Azure Government VMs, a policy key in HKCU:\Software\Policies\... can override the
+# standard HKCU:\Control Panel\Desktop\Wallpaper key, causing Set-JSDesktopBackground to
+# appear to succeed while Explorer ignores the change.
+$hkcuPolicyPath = 'HKCU:\Software\Policies\Microsoft\Windows\Personalization'
+if (Test-Path $hkcuPolicyPath) {
+    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaper'              -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaperStyle'         -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'PreventChangingWallPaper' -ErrorAction SilentlyContinue
+    Write-Host "Cleared HKCU Group Policy wallpaper overrides."
+}
+
+# Ensure HKCU registry points at the BMP with Fill (style 10) scaling
 Set-ItemProperty -Path $regPath -Name 'Wallpaper'      -Value $targetWallpaperPath
 Set-ItemProperty -Path $regPath -Name 'WallpaperStyle' -Value '10'   # 10 = Fill
 Set-ItemProperty -Path $regPath -Name 'TileWallpaper'  -Value '0'
 
-# Also apply via Win32 API for the current interactive session (works when shell is ready)
-Set-JSDesktopBackground -ImagePath $targetWallpaperPath
+# Apply via Win32 SystemParametersInfo directly (P/Invoke is more reliable than RUNDLL32
+# from a scheduled task context in Azure Government sessions).
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class WallpaperHelper {
+    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, string pvParam, uint fWinIni);
+}
+'@ -ErrorAction SilentlyContinue
+    # SPI_SETDESKWALLPAPER=20, SPIF_UPDATEINIFILE|SPIF_SENDWININICHANGE=3
+    [WallpaperHelper]::SystemParametersInfo(20, 0, $targetWallpaperPath, 3) | Out-Null
+} catch {
+    Write-Host "P/Invoke wallpaper set skipped: $_"
+}
 
-# Force the desktop to reload the wallpaper file from disk
+# Also apply via the helper module function and force a desktop reload
+Set-JSDesktopBackground -ImagePath $targetWallpaperPath
 RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
 Write-Host 'Wallpaper applied successfully.'
 
