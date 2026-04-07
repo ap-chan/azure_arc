@@ -49,7 +49,7 @@
     },
     "vmSize": {
       "type": "string",
-      "defaultValue": "Standard_B4ms",
+      "defaultValue": "Standard_D4as_v6",
       "metadata": {
         "description": "The size of the VM"
       }

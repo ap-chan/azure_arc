@@ -68,6 +68,13 @@ param guid string = substring(newGuid(),0,4)
 @description('Azure location to deploy all resources')
 param location string = resourceGroup().location
 
+@description('Target Azure cloud environment')
+@allowed([
+  'AzureCloud'
+  'AzureUSGovernment'
+])
+param azureEnvironment string = 'AzureCloud'
+
 @description('The custom location RPO ID. This parameter is only needed when deploying the DataOps flavor.')
 param customLocationRPOID string = newGuid()
 
@@ -100,7 +107,7 @@ param enableAzureSpotPricing bool = false
   '2'
   '3'
 ])
-param zones string = '1'
+param zones string?
 
 @secure()
 param registryPassword string = newGuid()
@@ -215,6 +222,7 @@ module clientVmDeployment 'clientVm/clientVm.bicep' = {
     sqlServerEdition: sqlServerEdition
     zones: zones
     enableAzureSpotPricing: enableAzureSpotPricing
+    azureEnvironment: azureEnvironment
   }
   dependsOn: [
     updateVNetDNSServers
@@ -244,6 +252,7 @@ module mgmtArtifactsAndPolicyDeployment 'mgmt/mgmtArtifacts.bicep' = {
     windowsAdminPassword: windowsAdminPassword
     registryPassword: registryPassword
     natGatewayName: natGatewayName
+    azureEnvironment: azureEnvironment
   }
 }
 
@@ -275,6 +284,7 @@ module updateVNetDNSServers 'mgmt/mgmtArtifacts.bicep' = if (flavor == 'DataOps'
     '168.63.129.16'
     ]
     namingPrefix: namingPrefix
+    azureEnvironment: azureEnvironment
   }
   dependsOn: [
     addsVmDeployment

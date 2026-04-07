@@ -64,6 +64,9 @@ param resourceTags object = {
   Solution: 'jumpstart_arcbox'
 }
 
+@description('Target Azure cloud environment')
+param azureEnvironment string = 'AzureCloud'
+
 @maxLength(7)
 @description('The naming prefix for the nested virtual machines. Example: ArcBox-Win2k19')
 param namingPrefix string = 'ArcBox'
@@ -638,6 +641,7 @@ module policyDeployment './policyAzureArc.bicep' = {
     logAnalyticsWorkspaceId: workspace.id
     flavor: flavor
     resourceTags: resourceTags
+    azureEnvironment: azureEnvironment
   }
 }
 

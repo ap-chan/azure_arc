@@ -20,7 +20,7 @@ param windowsOSVersion string = '2025-datacenter-g2'
 param azureLocation string = resourceGroup().location
 
 @description('The size of the VM')
-param vmSize string = 'Standard_B2ms'
+param vmSize string = 'Standard_D2as_v6'
 
 @description('Choice to deploy Azure Bastion')
 param deployBastion bool = false

@@ -64,7 +64,7 @@
     },
     "agentVMSize": {
       "type": "string",
-      "defaultValue": "Standard_D8s_v4",
+      "defaultValue": "Standard_D8as_v6",
       "metadata": {
         "description": "The size of the Virtual Machine"
       }

@@ -12,10 +12,14 @@ param resourceTags object = {
   Solution: 'jumpstart_arcbox'
 }
 
+@description('Target Azure cloud environment')
+param azureEnvironment string = 'AzureCloud'
+
 param azureUpdateManagerArcPolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/bfea026e-043f-4ff4-9d1b-bf301ca7ff46'
 param azureUpdateManagerAzurePolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/59efceea-0c96-497e-a4a1-4eb2290dac15'
-param sshPostureControlLinuxAzurePolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/a8f3e6a6-dcd2-434c-b0f7-6f309ce913b4'
-param sshPostureControlWindowsAzurePolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/fe4e11ff-f561-4d4a-877c-256cc0b6470e'
+// Commented out - SSH Posture Control policy definitions have been retired by Microsoft
+// param sshPostureControlLinuxAzurePolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/a8f3e6a6-dcd2-434c-b0f7-6f309ce913b4'
+// param sshPostureControlWindowsAzurePolicyId string = '/providers/Microsoft.Authorization/policyDefinitions/fe4e11ff-f561-4d4a-877c-256cc0b6470e'
 param azureMachineConfigurationPrerequisitePolicyId string = '/providers/Microsoft.Authorization/policySetDefinitions/12794019-7a00-42cf-95c2-882eed337cc8'
 
 param tagsRoleDefinitionId string = '/subscriptions/${subscription().subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c'
@@ -23,7 +27,7 @@ param tagsRoleDefinitionId string = '/subscriptions/${subscription().subscriptio
 var policies = [
   {
     name: '(ArcBox) Enable Azure Monitor for Hybrid VMs with AMA'
-    definitionId: '/providers/Microsoft.Authorization/policySetDefinitions/59e9c3eb-d8df-473b-8059-23fd38ddd0f0'
+    definitionId: '/providers/Microsoft.Authorization/policySetDefinitions/2b00397d-c309-49c4-aa5a-f0b2c5bc6321'
     flavors: [
       'ITPro'
     ]
@@ -52,7 +56,10 @@ var policies = [
   }
 ]
 
-resource policies_name 'Microsoft.Authorization/policyAssignments@2025-01-01' = [for item in policies: if (contains(item.flavors, flavor)) {
+var isAzureGovernment = azureEnvironment == 'AzureUSGovernment'
+var isAMAPolicyApplicable = contains(policies[0].flavors, flavor) && !isAzureGovernment
+
+resource policies_name 'Microsoft.Authorization/policyAssignments@2025-01-01' = [for item in policies: if (contains(item.flavors, flavor) && !(isAzureGovernment && contains(item.definitionId, '2b00397d-c309-49c4-aa5a-f0b2c5bc6321'))) {
   name: item.name
   location: azureLocation
   identity: {
@@ -64,29 +71,29 @@ resource policies_name 'Microsoft.Authorization/policyAssignments@2025-01-01' = 
   }
 }]
 
-resource policy_AMA_role_0 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (contains(policies[0].flavors, flavor)) {
+resource policy_AMA_role_0 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (isAMAPolicyApplicable) {
   name: guid( policies[0].name, policies[0].roleDefinition[0],resourceGroup().id)
   properties: {
     roleDefinitionId: any(policies[0].roleDefinition[0])
-    principalId: contains(policies[0].flavors, flavor)?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
+    principalId: isAMAPolicyApplicable?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
     principalType: 'ServicePrincipal'
   }
 }
 
-resource policy_AMA_role_1 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (contains(policies[0].flavors, flavor)) {
+resource policy_AMA_role_1 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (isAMAPolicyApplicable) {
   name: guid( policies[0].name, policies[0].roleDefinition[1],resourceGroup().id)
   properties: {
     roleDefinitionId: any(policies[0].roleDefinition[1])
-    principalId: contains(policies[0].flavors, flavor)?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
+    principalId: isAMAPolicyApplicable?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
     principalType: 'ServicePrincipal'
   }
 }
 
-resource policy_AMA_role_2 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (contains(policies[0].flavors, flavor)) {
+resource policy_AMA_role_2 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (isAMAPolicyApplicable) {
   name: guid( policies[0].name, policies[0].roleDefinition[2],resourceGroup().id)
   properties: {
     roleDefinitionId: any(policies[0].roleDefinition[2])
-    principalId: contains(policies[0].flavors, flavor)?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
+    principalId: isAMAPolicyApplicable?policies_name[0]!.identity.principalId:guid('policies_name_id${0}')
     principalType: 'ServicePrincipal'
   }
 }
@@ -205,37 +212,39 @@ resource updateManagerAzurePolicyLinux  'Microsoft.Authorization/policyAssignmen
   }
 }
 
-resource sshPostureControlLinuxAudit  'Microsoft.Authorization/policyAssignments@2025-01-01' = {
-  name: '(ArcBox) Enable SSH Posture Control audit for Linux'
-  location: azureLocation
-  scope: resourceGroup()
-  properties:{
-    displayName: '(ArcBox) Enable SSH Posture Control audit for Linux (powered by OSConfig)'
-    description: 'Enable SSH Posture Control for Linux in audit mode'
-    policyDefinitionId: sshPostureControlLinuxAzurePolicyId
-    parameters: {
-      IncludeArcMachines: {
-        value: 'true'
-      }
-    }
-  }
-}
+// Commented out - SSH Posture Control Linux policy definition has been retired by Microsoft
+// resource sshPostureControlLinuxAudit  'Microsoft.Authorization/policyAssignments@2025-01-01' = {
+//   name: '(ArcBox) Enable SSH Posture Control audit for Linux'
+//   location: azureLocation
+//   scope: resourceGroup()
+//   properties:{
+//     displayName: '(ArcBox) Enable SSH Posture Control audit for Linux (powered by OSConfig)'
+//     description: 'Enable SSH Posture Control for Linux in audit mode'
+//     policyDefinitionId: sshPostureControlLinuxAzurePolicyId
+//     parameters: {
+//       IncludeArcMachines: {
+//         value: 'true'
+//       }
+//     }
+//   }
+// }
 
-resource sshPostureControlWindowsAudit  'Microsoft.Authorization/policyAssignments@2025-01-01' = {
-  name: '(ArcBox) Enable SSH Posture Control audit for Windows'
-  location: azureLocation
-  scope: resourceGroup()
-  properties:{
-    displayName: '(ArcBox) Enable SSH Posture Control audit for Windows (powered by OSConfig)'
-    description: 'Enable SSH Posture Control for Windows in audit mode'
-    policyDefinitionId: sshPostureControlWindowsAzurePolicyId
-    parameters: {
-      IncludeArcMachines: {
-        value: 'true'
-      }
-    }
-  }
-}
+// Commented out - SSH Posture Control Windows policy definition has been retired by Microsoft
+// resource sshPostureControlWindowsAudit  'Microsoft.Authorization/policyAssignments@2025-01-01' = {
+//   name: '(ArcBox) Enable SSH Posture Control audit for Windows'
+//   location: azureLocation
+//   scope: resourceGroup()
+//   properties:{
+//     displayName: '(ArcBox) Enable SSH Posture Control audit for Windows (powered by OSConfig)'
+//     description: 'Enable SSH Posture Control for Windows in audit mode'
+//     policyDefinitionId: sshPostureControlWindowsAzurePolicyId
+//     parameters: {
+//       IncludeArcMachines: {
+//         value: 'true'
+//       }
+//     }
+//   }
+// }
 
 resource azureMachineConfigurationPrerequisitePolicy  'Microsoft.Authorization/policyAssignments@2025-01-01' = {
   name: '(ArcBox) Deploy prerequisites to enable Machine Configuration'

@@ -393,14 +393,14 @@ if ($Env:flavor -ne 'DevOps') {
         } else {
             # Arc SQL Server extension is not installed or still in progress.
             $retryCount = $retryCount + 1
-            if ($retryCount -gt 10) {
+            if ($retryCount -gt 20) {
                 Write-Warning "Timeout exceeded installing SQL server extension. Retry count: $retryCount."
             } else {
                 Write-Host "Waiting for SQL server extension installation ... Retry count: $retryCount"
                 Start-Sleep(30)
             }
         }
-    } while ($retryCount -le 10)
+    } while ($retryCount -le 20)
 
     # Register Microsoft.AzureArcData provider - required for SqlServerInstances resource and migration assessment.
     # The VM managed identity has Owner at RG scope but 'register/action' requires subscription scope.
@@ -523,14 +523,14 @@ if ($Env:flavor -ne 'DevOps') {
             break
         } catch {
             $retryCount++
-            if ($retryCount -gt 15) {
+            if ($retryCount -gt 30) {
                 Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
                 break
             }
             Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
             Start-Sleep(30)
         }
-    } while ($retryCount -le 15)
+    } while ($retryCount -le 30)
 
     $migrationApiURL = "${armEndpoint}/batch?api-version=2020-06-01"
     $assessmentName = (New-Guid).Guid
@@ -1027,11 +1027,25 @@ Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -Destinat
 # -----------------------------------------------------------------------
 
 # 1. Set system-wide via PersonalizationCSP — all users, survives reboot
+#    IMPORTANT: DesktopImageUrl only accepts HTTP/HTTPS URLs; local paths must use DesktopImagePath.
+#    PersonalizationCSP requires MDM enrollment on Windows Server, so also set the LGPO policy key
+#    (HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization) which Explorer honors at logon
+#    without MDM enrollment.
 $cspPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP'
 if (-not (Test-Path $cspPath)) { New-Item -Path $cspPath -Force | Out-Null }
-Set-ItemProperty -Path $cspPath -Name 'DesktopImageUrl'    -Value $wallpaperBmpPath -Type String -Force
-Set-ItemProperty -Path $cspPath -Name 'DesktopImageStatus' -Value 1                -Type DWord  -Force
+# Remove any stale DesktopImageUrl value so it does not override DesktopImagePath.
+Remove-ItemProperty -Path $cspPath -Name 'DesktopImageUrl' -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $cspPath -Name 'DesktopImagePath'   -Value $wallpaperBmpPath -Type String -Force
+Set-ItemProperty -Path $cspPath -Name 'DesktopImageStatus' -Value 1                 -Type DWord  -Force
 Write-Host "PersonalizationCSP wallpaper configured (all users): $wallpaperBmpPath"
+
+# Reliable non-MDM fallback: LGPO Personalization policy path — read by Explorer at logon on
+# Windows Server without MDM enrollment.  Sets 'Desktop Wallpaper' (note the space in the key name).
+$lgpoPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'
+if (-not (Test-Path $lgpoPolicyPath)) { New-Item -Path $lgpoPolicyPath -Force | Out-Null }
+Set-ItemProperty -Path $lgpoPolicyPath -Name 'Desktop Wallpaper'    -Value $wallpaperBmpPath -Type String -Force
+Set-ItemProperty -Path $lgpoPolicyPath -Name 'WallpaperStyle'        -Value '10'              -Type String -Force
+Write-Host "LGPO Personalization policy wallpaper set (Windows Server non-MDM fallback): $wallpaperBmpPath"
 
 # 2. Set wallpaper in the Default User hive so any future new accounts inherit it
 $mountKey = 'HKU\TempDefaultUser'

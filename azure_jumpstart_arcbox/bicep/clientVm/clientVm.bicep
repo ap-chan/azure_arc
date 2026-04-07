@@ -136,7 +136,7 @@ var bastionName = '${namingPrefix}-Bastion'
 var publicIpAddressName = deployBastion == false ? '${vmName}-PIP' : '${bastionName}-PIP'
 var networkInterfaceName = '${vmName}-NIC'
 var osDiskType = 'Premium_LRS'
-var bootstrapFileUri = 'https://raw.githubusercontent.com/${githubUser}/azure_arc/${githubBranch}/azure_jumpstart_arcbox/artifacts/Bootstrap.ps1'
+var bootstrapFileUri = '${templateBaseUrl}artifacts/Bootstrap.ps1'
 var PublicIPNoBastion = {
   id: publicIpAddress.id
 }

@@ -317,7 +317,7 @@
             },
             "vmSize": {
               "type": "string",
-              "defaultValue": "Standard_B4ms",
+              "defaultValue": "Standard_D4as_v6",
               "metadata": {
                 "description": "The size of the VM"
               }
@@ -691,7 +691,7 @@
           "variables": {
             "networkInterfaceName": "[format('{0}-NIC', parameters('vmName'))]",
             "osDiskType": "Premium_LRS",
-            "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_B2ms', 'Standard_B8ms')]",
+            "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_D2as_v6', 'Standard_D8as_v6')]",
             "diskSize": "[if(equals(parameters('flavor'), 'DataOps'), 512, 64)]"
           },
           "resources": [
@@ -922,7 +922,7 @@
             },
             "vmSize": {
               "type": "string",
-              "defaultValue": "Standard_B4ms",
+              "defaultValue": "Standard_D4as_v6",
               "metadata": {
                 "description": "The size of the VM"
               }
@@ -1296,7 +1296,7 @@
           "variables": {
             "networkInterfaceName": "[format('{0}-NIC', parameters('vmName'))]",
             "osDiskType": "Premium_LRS",
-            "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_B2ms', 'Standard_B8ms')]",
+            "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_D2as_v6', 'Standard_D8as_v6')]",
             "diskSize": "[if(equals(parameters('flavor'), 'DataOps'), 512, 64)]"
           },
           "resources": [
@@ -1586,7 +1586,7 @@
             },
             "windowsOSVersion": {
               "type": "string",
-              "defaultValue": "2025-datacenter-g2",
+              "defaultValue": "win11-25h2-ent",
               "metadata": {
                 "description": "The Windows version for the VM. This will pick a fully patched image of this given Windows version"
               }
@@ -1777,7 +1777,7 @@
             },
             "vmsDiskSku": {
               "type": "string",
-              "defaultValue": "PremiumV2_LRS",
+              "defaultValue": "Premium_LRS",
               "metadata": {
                 "description": "The SKU of the VMs disk"
               }
@@ -1910,7 +1910,7 @@
               },
               "properties": {
                 "hardwareProfile": {
-                  "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_B4ms', if(equals(parameters('flavor'), 'DataOps'), 'Standard_D8s_v5', 'Standard_D8s_v5'))]"
+                  "vmSize": "[if(equals(parameters('flavor'), 'DevOps'), 'Standard_D4as_v6', if(equals(parameters('flavor'), 'DataOps'), 'Standard_D8ads_v6', 'Standard_D8ads_v6'))]"
                 },
                 "storageProfile": {
                   "osDisk": {
@@ -1923,8 +1923,8 @@
                     "diskSizeGB": 127
                   },
                   "imageReference": {
-                    "publisher": "MicrosoftWindowsServer",
-                    "offer": "WindowsServer",
+                    "publisher": "MicrosoftWindowsDesktop",
+                    "offer": "windows-11",
                     "sku": "[parameters('windowsOSVersion')]",
                     "version": "latest"
                   },
@@ -5752,7 +5752,7 @@
             },
             "vmSize": {
               "type": "string",
-              "defaultValue": "Standard_B2ms",
+              "defaultValue": "Standard_D2as_v6",
               "metadata": {
                 "description": "The size of the VM"
               }
@@ -9530,7 +9530,7 @@
             },
             "agentVMSize": {
               "type": "string",
-              "defaultValue": "Standard_D8s_v4",
+              "defaultValue": "Standard_D8as_v6",
               "metadata": {
                 "description": "The size of the Virtual Machine"
               }
