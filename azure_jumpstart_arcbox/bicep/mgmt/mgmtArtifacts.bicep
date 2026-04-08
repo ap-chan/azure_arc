@@ -689,3 +689,4 @@ resource registryPassword_kv_secret 'Microsoft.KeyVault/vaults/secrets@2024-04-0
 
 output vnetId string = arcVirtualNetwork.id
 output subnetId string = arcVirtualNetwork.properties.subnets[0].id
+output keyVaultName string = keyVaultName

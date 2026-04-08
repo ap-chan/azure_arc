@@ -223,6 +223,7 @@ module clientVmDeployment 'clientVm/clientVm.bicep' = {
     zones: zones
     enableAzureSpotPricing: enableAzureSpotPricing
     azureEnvironment: azureEnvironment
+    keyVaultName: mgmtArtifactsAndPolicyDeployment.outputs.keyVaultName
   }
   dependsOn: [
     updateVNetDNSServers

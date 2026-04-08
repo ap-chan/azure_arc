@@ -35,7 +35,8 @@ param (
     [string]$debugEnabled,
     [string]$sqlServerEdition,
     [string]$autoShutdownEnabled,
-    [string]$azureEnvironment = 'AzureCloud'
+    [string]$azureEnvironment = 'AzureCloud',
+    [string]$keyVaultName = ''
 )
 
 [System.Environment]::SetEnvironmentVariable('adminUsername', $adminUsername, [System.EnvironmentVariableTarget]::Machine)
@@ -245,26 +246,56 @@ if ($null -ne $tags) {
 
 $null = Set-AzResourceGroup -ResourceGroupName $resourceGroup -Tag $tags
 
-# Retry Get-AzKeyVault — RBAC role assignments (Owner/KeyVaultAdministrator) may take several minutes
-# to propagate after the role assignment resource is created in Azure, even though the Bootstrap CSE
-# dependsOn those resources.  If the managed identity lacks RBAC permission at the time of the call,
-# Get-AzKeyVault returns an empty collection (no error), making $KeyVault null and crashing Get-Secret.
-$KeyVault = $null
-for ($kvRetry = 1; $kvRetry -le 20; $kvRetry++) {
-    $KeyVault = Get-AzKeyVault -ResourceGroupName $resourceGroup
-    if ($KeyVault) {
-        Write-Host "Key Vault found: $($KeyVault.VaultName) (attempt $kvRetry)"
-        break
+# Resolve Key Vault object.
+# The Key Vault name is passed in directly from the Bicep deployment (deterministic uniqueString)
+# so we do a targeted Get-AzKeyVault -VaultName lookup instead of an RBAC-gated list call.
+# This avoids the race condition where Get-AzKeyVault -ResourceGroupName returns empty while
+# RBAC role assignments are still propagating (which can exceed 10 min in Azure Government).
+# Fall back to resource-group enumeration with retries if the parameter was not provided.
+if ($keyVaultName) {
+    Write-Host "Key Vault name provided by deployment: '$keyVaultName'. Looking up vault object..."
+    $KeyVault = $null
+    for ($kvRetry = 1; $kvRetry -le 20; $kvRetry++) {
+        $KeyVault = Get-AzKeyVault -VaultName $keyVaultName -ErrorAction SilentlyContinue
+        if ($KeyVault) {
+            Write-Host "Key Vault found: $($KeyVault.VaultName) (attempt $kvRetry)"
+            break
+        }
+        Write-Warning "Get-AzKeyVault -VaultName '$keyVaultName' returned null (attempt $kvRetry/20). Retrying in 30s..."
+        if ($kvRetry -eq 20) {
+            Write-Error "FATAL: Get-AzKeyVault -VaultName '$keyVaultName' failed after 20 attempts. Cannot retrieve windowsAdminPassword."
+            Stop-Transcript
+            exit 1
+        }
+        Start-Sleep -Seconds 30
+        if ($azureEnvironment -eq 'AzureUSGovernment') {
+            Connect-AzAccount -Identity -Environment AzureUSGovernment -ErrorAction SilentlyContinue | Out-Null
+        } else {
+            Connect-AzAccount -Identity -ErrorAction SilentlyContinue | Out-Null
+        }
     }
-    Write-Warning "Key Vault not found in resource group '$resourceGroup' (attempt $kvRetry/20) — RBAC may still be propagating. Retrying in 30s..."
-    if ($kvRetry -eq 20) {
-        Write-Error "FATAL: Key Vault not found in resource group '$resourceGroup' after 20 attempts (10 minutes). Cannot retrieve windowsAdminPassword."
-        Stop-Transcript
-        exit 1
+} else {
+    Write-Warning "keyVaultName parameter not provided. Falling back to Get-AzKeyVault -ResourceGroupName (RBAC propagation may cause delays)."
+    $KeyVault = $null
+    for ($kvRetry = 1; $kvRetry -le 20; $kvRetry++) {
+        $KeyVault = Get-AzKeyVault -ResourceGroupName $resourceGroup
+        if ($KeyVault) {
+            Write-Host "Key Vault found: $($KeyVault.VaultName) (attempt $kvRetry)"
+            break
+        }
+        Write-Warning "Key Vault not found in resource group '$resourceGroup' (attempt $kvRetry/20). Retrying in 30s..."
+        if ($kvRetry -eq 20) {
+            Write-Error "FATAL: Key Vault not found in resource group '$resourceGroup' after 20 attempts. Cannot retrieve windowsAdminPassword."
+            Stop-Transcript
+            exit 1
+        }
+        Start-Sleep -Seconds 30
+        if ($azureEnvironment -eq 'AzureUSGovernment') {
+            Connect-AzAccount -Identity -Environment AzureUSGovernment -ErrorAction SilentlyContinue | Out-Null
+        } else {
+            Connect-AzAccount -Identity -ErrorAction SilentlyContinue | Out-Null
+        }
     }
-    Start-Sleep -Seconds 30
-    # Refresh the token — the current token may pre-date the role assignment and lack the new permissions.
-    Connect-AzAccount -Identity $(if ($azureEnvironment -eq 'AzureUSGovernment') { '-Environment AzureUSGovernment' }) -ErrorAction SilentlyContinue | Out-Null
 }
 
 # Set Key Vault Name as an environment variable (used by DevOps flavor)
