@@ -245,7 +245,27 @@ if ($null -ne $tags) {
 
 $null = Set-AzResourceGroup -ResourceGroupName $resourceGroup -Tag $tags
 
-$KeyVault = Get-AzKeyVault -ResourceGroupName $resourceGroup
+# Retry Get-AzKeyVault — RBAC role assignments (Owner/KeyVaultAdministrator) may take several minutes
+# to propagate after the role assignment resource is created in Azure, even though the Bootstrap CSE
+# dependsOn those resources.  If the managed identity lacks RBAC permission at the time of the call,
+# Get-AzKeyVault returns an empty collection (no error), making $KeyVault null and crashing Get-Secret.
+$KeyVault = $null
+for ($kvRetry = 1; $kvRetry -le 20; $kvRetry++) {
+    $KeyVault = Get-AzKeyVault -ResourceGroupName $resourceGroup
+    if ($KeyVault) {
+        Write-Host "Key Vault found: $($KeyVault.VaultName) (attempt $kvRetry)"
+        break
+    }
+    Write-Warning "Key Vault not found in resource group '$resourceGroup' (attempt $kvRetry/20) — RBAC may still be propagating. Retrying in 30s..."
+    if ($kvRetry -eq 20) {
+        Write-Error "FATAL: Key Vault not found in resource group '$resourceGroup' after 20 attempts (10 minutes). Cannot retrieve windowsAdminPassword."
+        Stop-Transcript
+        exit 1
+    }
+    Start-Sleep -Seconds 30
+    # Refresh the token — the current token may pre-date the role assignment and lack the new permissions.
+    Connect-AzAccount -Identity $(if ($azureEnvironment -eq 'AzureUSGovernment') { '-Environment AzureUSGovernment' }) -ErrorAction SilentlyContinue | Out-Null
+}
 
 # Set Key Vault Name as an environment variable (used by DevOps flavor)
 [System.Environment]::SetEnvironmentVariable('keyVaultName', $KeyVault.VaultName, [System.EnvironmentVariableTarget]::Machine)

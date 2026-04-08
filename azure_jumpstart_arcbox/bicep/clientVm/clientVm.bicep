@@ -259,6 +259,8 @@ resource vmBootstrap 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' =
   }
   dependsOn: [
     vmRoleAssignment_Storage
+    vmRoleAssignment_Owner
+    vmRoleAssignment_KeyVaultAdministrator
   ]
   properties: {
     publisher: 'Microsoft.Compute'
