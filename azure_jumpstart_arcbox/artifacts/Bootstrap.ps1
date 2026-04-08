@@ -308,10 +308,13 @@ Import-Module Microsoft.PowerShell.SecretManagement
 # Ensure you have installed the SecretManagement and SecretStore modules along with the Key Vault extension
 
 if (-not (Get-SecretVault -Name $KeyVault.VaultName -ErrorAction Ignore)) {
-    # Use VaultUri (not VaultName) so Az.KeyVault SecretManagement uses the correct cloud endpoint.
-    # In Azure Government this is *.vault.usgovcloudapi.net; commercial is *.vault.azure.net.
-    # Passing just VaultName causes the extension to default to the commercial URI, triggering AKV10046.
-    Register-SecretVault -Name $KeyVault.VaultName -ModuleName Az.KeyVault -VaultParameters @{ AZKVaultName = $KeyVault.VaultUri } -DefaultVault
+    # Pass VaultName (not VaultUri) to AZKVaultName. The Az.KeyVault SecretManagement adapter
+    # passes this value directly to Get-AzKeyVaultSecret -VaultName, which constructs the
+    # correct endpoint URL from the current Az context environment (AzureUSGovernment here).
+    # Passing the full VaultUri causes the adapter to double-construct a URL like
+    # 'https://https://vault.vault.usgovcloudapi.net...' which fails with "Invalid URI: The
+    # hostname could not be parsed."
+    Register-SecretVault -Name $KeyVault.VaultName -ModuleName Az.KeyVault -VaultParameters @{ AZKVaultName = $KeyVault.VaultName } -DefaultVault
 }
 
 $adminPassword = Get-Secret -Name windowsAdminPassword -AsPlainText
