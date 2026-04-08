@@ -37,36 +37,47 @@ Write-Output "Adding deployment test results to wallpaper using BGInfo"
 Set-Content "$Env:windir\TEMP\arcbox-tests-succeeded.txt" $tests_passed
 Set-Content "$Env:windir\TEMP\arcbox-tests-failed.txt" $tests_failed
 
-# Ensure the PNG-to-BMP conversion is complete for BGInfo to use
+# Ensure wallpaper.bmp exists and configure all wallpaper registry paths to point to it.
+# Never overwrite system-protected files (img0.jpg etc.) — always use C:\ArcBox\wallpaper.bmp
+# as the canonical wallpaper file and redirect everything there.
+$arcboxWallpaperBmp = "$Env:ArcBoxDir\wallpaper.bmp"
 try {
-    if (-not (Test-Path "$Env:ArcBoxDir\wallpaper.bmp")) {
+    if (-not (Test-Path $arcboxWallpaperBmp)) {
         Write-Host "Converting wallpaper PNG to BMP format for BGInfo..."
-        Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath "$Env:ArcBoxDir\wallpaper.bmp" -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $img = [System.Drawing.Image]::FromFile("$Env:ArcBoxDir\wallpaper.png")
+        $bmp = New-Object System.Drawing.Bitmap($img)
+        $bmp.Save($arcboxWallpaperBmp, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $img.Dispose(); $bmp.Dispose()
     }
 
-    # Resolve which file Windows is currently configured to use as the wallpaper and replace
-    # its content — the same file-replacement approach used in ArcServersLogonScript.ps1 to
-    # work reliably in Azure Government where SystemParametersInfo may fail silently.
-    $regWallpaper = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper' -ErrorAction SilentlyContinue).Wallpaper
-    $candidatePaths = @(
-        $regWallpaper,
-        'C:\Windows\Web\Wallpaper\Windows\img0.jpg',
-        'C:\Windows\Web\4K\Wallpaper\Windows\img0_3840x2160.jpg'
-    )
-    $targetWallpaperPath = $candidatePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
-    if ($null -eq $targetWallpaperPath) { $targetWallpaperPath = "$Env:ArcBoxDir\wallpaper.bmp" }
+    # Point HKCU directly at wallpaper.bmp — do NOT copy over system files
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper'      -Value $arcboxWallpaperBmp -Force
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Value '10' -Force
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Value '0'  -Force
 
-    Copy-Item -Path "$Env:ArcBoxDir\wallpaper.bmp" -Destination $targetWallpaperPath -Force -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper'      -Value $targetWallpaperPath
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Value '10'
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Value '0'
-    Set-JSDesktopBackground -ImagePath $targetWallpaperPath -ErrorAction Stop
+    # Broadcast the change to Explorer in the current session
+    Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public class WpHelper2 {
+    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool SystemParametersInfo(uint a, uint b, string c, uint d);
+}
+'@ -ErrorAction SilentlyContinue
+    [WpHelper2]::SystemParametersInfo(20, 0, $arcboxWallpaperBmp, 3) | Out-Null
     RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
 } catch {
     Write-Warning "Failed to set wallpaper: $($_.Exception.Message)"
 }
 
 if (Test-Path "$Env:ArcBoxTestsDir\arcbox-bginfo.bgi") {
+    # BGInfo composites text onto the image at WallpaperSource (IE Desktop registry key), NOT
+    # HKCU\Control Panel\Desktop\WallPaper. Always set WallpaperSource to wallpaper.bmp so
+    # BGInfo composites on the ArcBox image, not the Windows default img0.jpg.
+    $ieDesktopKey = 'HKCU:\Software\Microsoft\Internet Explorer\Desktop\General'
+    if (-not (Test-Path $ieDesktopKey)) { New-Item -Path $ieDesktopKey -Force | Out-Null }
+    Set-ItemProperty -Path $ieDesktopKey -Name 'WallpaperSource' -Value $arcboxWallpaperBmp -Force
+
     bginfo.exe $Env:ArcBoxTestsDir\arcbox-bginfo.bgi /timer:0 /NOLICPROMPT
 }
 

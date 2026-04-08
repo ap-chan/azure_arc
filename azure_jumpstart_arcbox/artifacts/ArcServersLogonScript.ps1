@@ -513,29 +513,47 @@ if ($Env:flavor -ne 'DevOps') {
     # Run SQL Server Azure Migration Assessment
     Write-Host "Enabling SQL Server Azure Migration Assessment.`n"
 
-    # Wait for the SqlServerInstances resource to be created by the SQL extension before calling runMigrationAssessment
-    $sqlInstanceUri = "${armEndpoint}/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$SQLvmName`?api-version=2024-05-01-preview"
+    # Wait for the SqlServerInstances resource to be created by the SQL extension before calling runMigrationAssessment.
+    # IMPORTANT: The SqlServerInstances resource name is NOT the machine name — it is '<MachineName>_<SQLInstanceName>'
+    # (e.g. 'arcva-SQL_MSSQLSERVER' for the default instance). Discover it via az resource list filtered by name prefix
+    # to avoid hard-coding the instance name and to handle non-default instance names.
+    # NOTE: Invoke-WebRequest with a manual Bearer token and a preview API version is avoided here because
+    # Azure Government does not always expose the same preview API versions as public Azure, causing
+    # non-2xx responses (empty body '{}') that make every retry fail. Using az resource list lets the
+    # CLI handle cloud-specific endpoints and API version negotiation automatically.
+    $sqlInstanceResourceName = $null
     $retryCount = 0
     do {
-        try {
-            $null = Invoke-WebRequest -Method Get -Uri $sqlInstanceUri -Headers $headers -ErrorAction Stop
-            Write-Host "SqlServerInstances resource '$SQLvmName' found."
-            break
-        } catch {
-            $retryCount++
-            if ($retryCount -gt 30) {
-                Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
+        $listJson = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' --query "[?starts_with(name, '$SQLvmName')]" -o json 2>$null
+        if ($listJson) {
+            $instances = $listJson | ConvertFrom-Json
+            if ($instances -and $instances.Count -gt 0) {
+                $sqlInstanceResourceName = $instances[0].name
+                Write-Host "SqlServerInstances resource '$sqlInstanceResourceName' found for machine '$SQLvmName'."
                 break
             }
-            Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
-            Start-Sleep(30)
         }
+        $retryCount++
+        if ($retryCount -gt 30) {
+            Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
+            break
+        }
+        Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
+        Start-Sleep(30)
     } while ($retryCount -le 30)
+
+    # Fall back to machine name if discovery failed (preserves prior behaviour)
+    if (-not $sqlInstanceResourceName) { $sqlInstanceResourceName = $SQLvmName }
+
+    # Refresh token — the retry loop above can run for up to 15 minutes, potentially staling the token
+    # obtained earlier in the script.
+    $token = (az account get-access-token --subscription $subscriptionId --query accessToken --output tsv)
+    $headers = @{'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
 
     $migrationApiURL = "${armEndpoint}/batch?api-version=2020-06-01"
     $assessmentName = (New-Guid).Guid
     $payLoad = @"
-{"requests":[{"httpMethod":"POST","name":"$assessmentName","requestHeaderDetails":{"commandName":"Microsoft_Azure_HybridData_Platform."},"url":"${armEndpoint}/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$SQLvmName/runMigrationAssessment?api-version=2024-05-01-preview"}]}
+{"requests":[{"httpMethod":"POST","name":"$assessmentName","requestHeaderDetails":{"commandName":"Microsoft_Azure_HybridData_Platform."},"url":"${armEndpoint}/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.AzureArcData/SqlServerInstances/$sqlInstanceResourceName/runMigrationAssessment?api-version=2024-05-01-preview"}]}
 "@
 
     $httpResp = Invoke-WebRequest -Method Post -Uri $migrationApiURL -Body $payLoad -Headers $headers
@@ -582,44 +600,152 @@ if ($Env:flavor -ne 'DevOps') {
     Copy-VMFile $SQLvmName -SourcePath "$Env:ArcBoxDir\testDefenderForSQL.ps1" -DestinationPath $remoteScriptFileFile -CreateFullPath -FileSource Host -Force
     Invoke-Command -VMName $SQLvmName -ScriptBlock { powershell -File $Using:remoteScriptFileFile } -Credential $winCreds
 
-    # Pre-install the arcdata CLI extension explicitly to avoid pip auto-install failures
-    # (az sql server-arc subcommands require arcdata; dynamic pip install fails in restricted/gov environments)
+    # Install the arcdata Azure CLI extension via wheel zip-extraction.
+    # 'az extension add/update' calls pip to resolve dependencies against PyPI, which is unreachable
+    # in private-endpoint Azure Government deployments (pip exits with code 2).  The confirmed
+    # workaround is to download the wheel directly from the Azure CDN extension index (reachable),
+    # extract it as a zip into the extension directory (bypassing pip entirely), then install any
+    # missing Python dependencies one-at-a-time with 'pip install --no-deps' which reaches
+    # files.pythonhosted.org even when pypi.org is blocked.
     Write-Host "Installing arcdata Azure CLI extension.`n"
     az config set extension.dynamic_install_allow_preview=true 2>&1 | Out-Null
-    # Use $LASTEXITCODE to check — az extension show writes 'ERROR: ...' to stdout (not just stderr)
-    # in some CLI versions, making a string-based check produce false positives in the transcript.
-    az extension show --name arcdata 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        # In restricted/gov environments, 'az extension add --name arcdata' fails with
-        # "Pip failed with status code 2" because pip cannot reach PyPI or hits SSL issues.
-        # Workaround: download the wheel via PowerShell (uses system TLS/proxy settings),
-        # then install from the local file — pip does not need outbound network access for a local wheel.
-        # IMPORTANT: the wheel MUST be saved with its original filename (e.g. arcdata-1.2.3-py3-none-any.whl).
-        # Azure CLI parses the extension name from the wheel filename; renaming it to 'arcdata.whl'
-        # produces "Unable to determine extension name" and the install silently does nothing.
-        $arcdataWhlPath = $null
+
+    # ---- Locate Azure CLI bundled Python ----
+    # Parse az.cmd for the embedded Python path first; fall back to well-known MSI/WinGet locations.
+    $cliPythonExe = $null
+    $azCmdObj     = Get-Command az -ErrorAction SilentlyContinue
+    if ($azCmdObj) {
         try {
-            Write-Host "  Fetching arcdata wheel URL from Azure CLI extension index..."
-            $cliIndex = (Invoke-WebRequest -Uri 'https://aka.ms/azure-cli-extension-index-v1' -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-            $arcdataEntry = $cliIndex.extensions.arcdata | Select-Object -Last 1
-            if (-not $arcdataEntry -or -not $arcdataEntry.downloadUrl) { throw "arcdata not found in extension index." }
-            # Preserve the original wheel filename so the CLI can extract the extension name from it
-            $arcdataWhlFilename = ($arcdataEntry.downloadUrl -split '[/?#]' | Where-Object { $_ -match '\.whl$' } | Select-Object -Last 1)
-            if (-not $arcdataWhlFilename) { $arcdataWhlFilename = 'arcdata-latest-py2.py3-none-any.whl' }
-            $arcdataWhlPath = Join-Path $Env:TEMP $arcdataWhlFilename
-            Write-Host "  Downloading arcdata wheel from $($arcdataEntry.downloadUrl) -> $arcdataWhlFilename ..."
-            Invoke-WebRequest -Uri $arcdataEntry.downloadUrl -OutFile $arcdataWhlPath -UseBasicParsing -ErrorAction Stop
-            Write-Host "  Installing arcdata from local wheel..."
-            az extension add --source $arcdataWhlPath --yes --only-show-errors
-            Write-Host "arcdata extension installed successfully."
+            $cmdContent = Get-Content $azCmdObj.Source -ErrorAction Stop
+            foreach ($line in $cmdContent) {
+                if ($line -match '"([^"]+[pP]ython[^"]*\.exe)"') {
+                    $candidate = $Matches[1]
+                    if (Test-Path $candidate) { $cliPythonExe = $candidate; break }
+                }
+            }
+        } catch { }
+    }
+    if (-not $cliPythonExe) {
+        @(
+            'C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe',
+            'C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\python.exe',
+            "$env:LOCALAPPDATA\Programs\Azure CLI\python.exe",
+            "$env:ProgramFiles\Azure CLI\python.exe"
+        ) | ForEach-Object { if (-not $cliPythonExe -and (Test-Path $_)) { $cliPythonExe = $_ } }
+    }
+    Write-Host "  CLI Python: $(if ($cliPythonExe) { $cliPythonExe } else { '(not found)' })"
+
+    # Inject setuptools + wheel so the extension dir is importable by az.
+    if ($cliPythonExe) {
+        & $cliPythonExe -m pip install --quiet --disable-pip-version-check setuptools wheel 2>&1 | Out-Null
+    }
+
+    # ---- Determine extension directory ----
+    $azExtDir    = $null
+    $azExtDirVar = az config get extension.dir --query value -o tsv 2>$null
+    if ($azExtDirVar -and (Test-Path $azExtDirVar)) { $azExtDir = $azExtDirVar }
+    else { $azExtDir = "$env:USERPROFILE\.azure\cliextensions" }
+    if (-not (Test-Path $azExtDir)) { New-Item -ItemType Directory -Path $azExtDir -Force | Out-Null }
+
+    # ---- Remove any existing arcdata (stub or real) before fresh extraction ----
+    az extension remove --name arcdata 2>&1 | Out-Null
+    if (Test-Path "$azExtDir\arcdata") { Remove-Item "$azExtDir\arcdata" -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # ---- Resolve arcdata wheel URL from the Azure CLI extension index CDN ----
+    # The CDN (azcliextensionsync.blob.core.windows.net) is reachable from within Azure even
+    # with private endpoints; PyPI / GitHub may not be.
+    $arcdataWheelUrl  = $null
+    $arcdataWheelFile = "$env:TEMP\arcdata.whl"
+    try {
+        $indexJson    = (Invoke-WebRequest -Uri 'https://azcliextensionsync.blob.core.windows.net/index1/index.json' -UseBasicParsing -ErrorAction Stop).Content
+        $indexObj     = $indexJson | ConvertFrom-Json
+        $arcEntries   = $indexObj.extensions.arcdata
+        if ($arcEntries) {
+            $latest          = $arcEntries | Sort-Object { [version]($_.metadata.version) } | Select-Object -Last 1
+            $arcdataWheelUrl = $latest.downloadUrl
+            Write-Host "  arcdata latest: $($latest.metadata.version) — $arcdataWheelUrl"
+        }
+    } catch {
+        Write-Warning "  Could not fetch CLI extension index: $_"
+    }
+
+    # ---- Download wheel ----
+    if ($arcdataWheelUrl) {
+        try {
+            Invoke-WebRequest -Uri $arcdataWheelUrl -OutFile $arcdataWheelFile -UseBasicParsing -ErrorAction Stop
+            Write-Host "  Wheel downloaded: $arcdataWheelFile ($('{0:N0}' -f (Get-Item $arcdataWheelFile).Length) bytes)"
         } catch {
-            Write-Warning "Wheel-based arcdata install failed: $_. Falling back to direct install..."
-            az extension add --name arcdata --allow-preview true --only-show-errors
-        } finally {
-            if ($arcdataWhlPath) { Remove-Item $arcdataWhlPath -Force -ErrorAction SilentlyContinue }
+            Write-Warning "  Wheel download failed: $_"
+            $arcdataWheelFile = $null
         }
     } else {
-        Write-Host "arcdata extension already installed."
+        $arcdataWheelFile = $null
+    }
+
+    # ---- Extract wheel (zip) directly into extension dir — bypasses pip entirely ----
+    $arcdataVersion = $null
+    if ($arcdataWheelFile -and (Test-Path $arcdataWheelFile)) {
+        try {
+            $extractDir = "$azExtDir\arcdata"
+            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($arcdataWheelFile, $extractDir)
+            $arcdataVersion = az extension show --name arcdata --query 'version' -o tsv 2>$null
+            if ($arcdataVersion) {
+                Write-Host "  arcdata $arcdataVersion installed via wheel extraction."
+            } else {
+                Write-Warning "  Wheel extracted but az extension show did not report a version."
+            }
+        } catch {
+            Write-Warning "  Wheel extraction failed: $_"
+        }
+    } else {
+        Write-Warning "  arcdata wheel not available — 'az sql server-arc' commands may fail."
+    }
+
+    # ---- Repair missing Python dependencies iteratively ----
+    # arcdata and its transitive deps (kubernetes, durationpy, jsonpatch, etc.) are not bundled in
+    # the wheel.  Install them one round at a time with 'pip install --no-deps --target' so that
+    # each newly installed package's own imports are discovered in the next round.
+    # files.pythonhosted.org is reachable from Azure Gov private-endpoint VMs even when pypi.org is not.
+    if ($arcdataVersion -and $cliPythonExe) {
+        $maxDepRounds = 12
+        for ($depRound = 1; $depRound -le $maxDepRounds; $depRound++) {
+            $debugOut    = & az sql server-arc --help --debug 2>&1 | Out-String
+            $missingMods = [regex]::Matches($debugOut, "No module named '([^'.]+)(?:\.[^']*)?'") |
+                           ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+            if (-not $missingMods) {
+                Write-Host "  arcdata deps satisfied after $($depRound - 1) repair round(s)."
+                break
+            }
+            Write-Host "  [dep-repair round $depRound] Missing: $($missingMods -join ', ')"
+            $progressThisRound = $false
+            foreach ($mod in $missingMods) {
+                $pipPkg = $mod -replace '_', '-'
+                $out    = & $cliPythonExe -m pip install $pipPkg --no-deps `
+                              --target "$azExtDir\arcdata" --disable-pip-version-check 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "    installed $pipPkg"
+                    $progressThisRound = $true
+                } else {
+                    Write-Warning "    pip install $pipPkg failed (exit $($LASTEXITCODE)): $($out | Select-Object -Last 3 | Out-String)"
+                }
+            }
+            if (-not $progressThisRound) {
+                Write-Warning "  No progress in dep-repair round $depRound — stopping."
+                break
+            }
+            if ($depRound -eq $maxDepRounds) {
+                Write-Warning "  Reached max dep-repair rounds ($maxDepRounds). Some deps may still be missing."
+            }
+        }
+        # Final verification
+        $finalHelpOut = az sql server-arc --help 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "arcdata extension ready — 'az sql server-arc' loads correctly."
+        } else {
+            Write-Warning "arcdata installed but 'az sql server-arc --help' still fails. Check $Env:ArcBoxLogsDir for details."
+        }
     }
 
     # Enable least privileged access
@@ -1010,93 +1136,46 @@ try {
 #Changing to Jumpstart ArcBox wallpaper
 Write-Header 'Changing wallpaper'
 
-# bmp file is required for BGInfo
-$wallpaperBmpPath = "$Env:ArcBoxDir\wallpaper.bmp"
-Convert-JSImageToBitMap -SourceFilePath "$Env:ArcBoxDir\wallpaper.png" -DestinationFilePath $wallpaperBmpPath
-
-# -----------------------------------------------------------------------
-# Wallpaper strategy: HKLM PersonalizationCSP (all users, all sessions).
-#
-# HKCU / SystemParametersInfo / RUNDLL32 only affect the window station of
-# the calling process. A scheduled task running in a non-interactive session
-# cannot update the visible foreground desktop via those mechanisms — they
-# appear to succeed but Explorer ignores them. The PersonalizationCSP HKLM
-# key is the MDM-equivalent approach: Windows reads it at every user logon
-# and enforces it over any per-user HKCU setting, so it applies to all users
-# (including arcdemo) and survives reboots.
-# -----------------------------------------------------------------------
-
-# 1. Set system-wide via PersonalizationCSP — all users, survives reboot
-#    IMPORTANT: DesktopImageUrl only accepts HTTP/HTTPS URLs; local paths must use DesktopImagePath.
-#    PersonalizationCSP requires MDM enrollment on Windows Server, so also set the LGPO policy key
-#    (HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization) which Explorer honors at logon
-#    without MDM enrollment.
-$cspPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP'
-if (-not (Test-Path $cspPath)) { New-Item -Path $cspPath -Force | Out-Null }
-# Remove any stale DesktopImageUrl value so it does not override DesktopImagePath.
-Remove-ItemProperty -Path $cspPath -Name 'DesktopImageUrl' -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cspPath -Name 'DesktopImagePath'   -Value $wallpaperBmpPath -Type String -Force
-Set-ItemProperty -Path $cspPath -Name 'DesktopImageStatus' -Value 1                 -Type DWord  -Force
-Write-Host "PersonalizationCSP wallpaper configured (all users): $wallpaperBmpPath"
-
-# Reliable non-MDM fallback: LGPO Personalization policy path — read by Explorer at logon on
-# Windows Server without MDM enrollment.  Sets 'Desktop Wallpaper' (note the space in the key name).
-$lgpoPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'
-if (-not (Test-Path $lgpoPolicyPath)) { New-Item -Path $lgpoPolicyPath -Force | Out-Null }
-Set-ItemProperty -Path $lgpoPolicyPath -Name 'Desktop Wallpaper'    -Value $wallpaperBmpPath -Type String -Force
-Set-ItemProperty -Path $lgpoPolicyPath -Name 'WallpaperStyle'        -Value '10'              -Type String -Force
-Write-Host "LGPO Personalization policy wallpaper set (Windows Server non-MDM fallback): $wallpaperBmpPath"
-
-# 2. Set wallpaper in the Default User hive so any future new accounts inherit it
-$mountKey = 'HKU\TempDefaultUser'
-try {
-    & reg.exe load $mountKey 'C:\Users\Default\NTUSER.DAT' 2>&1 | Out-Null
-    $defDesktop = "Registry::$mountKey\Control Panel\Desktop"
-    if (-not (Test-Path $defDesktop)) { New-Item -Path $defDesktop -Force | Out-Null }
-    Set-ItemProperty -Path $defDesktop -Name 'Wallpaper'      -Value $wallpaperBmpPath -Force
-    Set-ItemProperty -Path $defDesktop -Name 'WallpaperStyle' -Value '10'              -Force
-    Set-ItemProperty -Path $defDesktop -Name 'TileWallpaper'  -Value '0'               -Force
-    Write-Host "Default User hive wallpaper set."
-} catch {
-    Write-Host "Default User hive update skipped: $_"
-} finally {
-    # Must release handles before unloading or reg.exe returns error 5
-    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-    & reg.exe unload $mountKey 2>&1 | Out-Null
+# Allow wallpaper in RDP/Bastion sessions. Azure Bastion and mstsc with bandwidth-saving
+# profiles set fDisableWallpaper=1 on the RDP-Tcp listener at connection time, causing
+# Explorer to suppress wallpaper rendering even when SPI_SETDESKWALLPAPER succeeds server-side.
+$winStationPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+if (Test-Path $winStationPath) {
+    Set-ItemProperty -Path $winStationPath -Name 'fDisableWallpaper' -Value 0 -Type DWord -Force
+    Write-Host "Set RDP-Tcp fDisableWallpaper=0 — wallpaper enabled for RDP/Bastion sessions."
 }
 
-# 3. Also apply for the current user (arcdemo) via HKCU + SystemParametersInfo
-#    so the change takes effect in the interactive session without requiring a logoff.
-#    Clear any HKCU Group Policy override that would block it.
-$regPath = 'HKCU:\Control Panel\Desktop'
-$hkcuPolicyPath = 'HKCU:\Software\Policies\Microsoft\Windows\Personalization'
-if (Test-Path $hkcuPolicyPath) {
-    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaper'               -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'WallPaperStyle'          -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $hkcuPolicyPath -Name 'PreventChangingWallPaper' -ErrorAction SilentlyContinue
-    Write-Host "Cleared HKCU Group Policy wallpaper overrides."
+# Convert wallpaper PNG to BMP (compositing onto black to remove alpha channel) and apply
+$wallpaperPng = "$Env:ArcBoxDir\wallpaper.png"
+$wallpaperBmp = "$Env:ArcBoxDir\wallpaper.bmp"
+if (Test-Path $wallpaperPng) {
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $img = [System.Drawing.Image]::FromFile($wallpaperPng)
+        $bmp = New-Object System.Drawing.Bitmap($img.Width, $img.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppRgb)
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.DrawImage($img, 0, 0, $img.Width, $img.Height)
+        $g.Dispose()
+        $bmp.Save($wallpaperBmp, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $img.Dispose(); $bmp.Dispose()
+        Write-Host "Wallpaper BMP created: $wallpaperBmp"
+    } catch {
+        Write-Warning "PNG to BMP conversion failed: $_"
+    }
 }
-Set-ItemProperty -Path $regPath -Name 'Wallpaper'      -Value $wallpaperBmpPath
-Set-ItemProperty -Path $regPath -Name 'WallpaperStyle' -Value '10'   # 10 = Fill
-Set-ItemProperty -Path $regPath -Name 'TileWallpaper'  -Value '0'
 
-try {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public class WallpaperHelper {
-    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, string pvParam, uint fWinIni);
+if (Test-Path $wallpaperBmp) {
+    # Point HKCU at wallpaper.bmp
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Wallpaper'      -Value $wallpaperBmp -Force
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Value '10'           -Force
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Value '0'            -Force
+
+    # BGInfo reads WallpaperSource (not HKCU\Control Panel\Desktop\Wallpaper) as its base image.
+    # Set it before BGInfo runs so it composites on the ArcBox image, not the Windows default.
+    $ieDesktopKey = 'HKCU:\Software\Microsoft\Internet Explorer\Desktop\General'
+    if (-not (Test-Path $ieDesktopKey)) { New-Item -Path $ieDesktopKey -Force | Out-Null }
+    Set-ItemProperty -Path $ieDesktopKey -Name 'WallpaperSource' -Value $wallpaperBmp -Force
 }
-'@ -ErrorAction SilentlyContinue
-    # SPI_SETDESKWALLPAPER=20, SPIF_UPDATEINIFILE|SPIF_SENDWININICHANGE=3
-    [WallpaperHelper]::SystemParametersInfo(20, 0, $wallpaperBmpPath, 3) | Out-Null
-} catch {
-    Write-Host "P/Invoke wallpaper set skipped: $_"
-}
-Set-JSDesktopBackground -ImagePath $wallpaperBmpPath
-RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters ,1,True
-Write-Host 'Wallpaper applied successfully.'
 
 if ($Env:flavor -eq 'ITPro') {
 
