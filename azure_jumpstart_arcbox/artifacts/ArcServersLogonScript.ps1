@@ -534,13 +534,16 @@ if ($Env:flavor -ne 'DevOps') {
             }
         }
         $retryCount++
-        if ($retryCount -gt 30) {
+        if ($retryCount -gt 60) {
             Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
+            # Diagnostic: list ALL AzureArcData resources in the RG to help troubleshoot
+            $allArcData = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' -o json 2>$null
+            Write-Host "All Microsoft.AzureArcData/sqlServerInstances in RG at timeout: $allArcData"
             break
         }
         Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
         Start-Sleep(30)
-    } while ($retryCount -le 30)
+    } while ($retryCount -le 60)
 
     # Fall back to machine name if discovery failed (preserves prior behaviour)
     if (-not $sqlInstanceResourceName) { $sqlInstanceResourceName = $SQLvmName }
@@ -641,10 +644,9 @@ if ($Env:flavor -ne 'DevOps') {
     }
 
     # ---- Determine extension directory ----
-    $azExtDir    = $null
-    $azExtDirVar = az config get extension.dir --query value -o tsv 2>$null
-    if ($azExtDirVar -and (Test-Path $azExtDirVar)) { $azExtDir = $azExtDirVar }
-    else { $azExtDir = "$env:USERPROFILE\.azure\cliextensions" }
+    # az config get extension.dir generates WARNING+ERROR noise in PS7 transcripts when the config key
+    # is not set (which is the default).  The default path is always correct for ArcBox, so skip the query.
+    $azExtDir = "$env:USERPROFILE\.azure\cliextensions"
     if (-not (Test-Path $azExtDir)) { New-Item -ItemType Directory -Path $azExtDir -Force | Out-Null }
 
     # ---- Remove any existing arcdata (stub or real) before fresh extraction ----

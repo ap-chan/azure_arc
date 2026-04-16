@@ -118,6 +118,30 @@ New-Item -Path $Env:agentScript -ItemType directory -Force
 New-Item -Path $Env:ArcBoxDataOpsDir -ItemType directory -Force
 New-Item -Path $Env:ArcBoxTestsDir -ItemType directory -Force
 
+# Register a startup scheduled task to reassign F: drive letter after VM stop/deallocate.
+# Azure managed data disks can lose their Windows drive letter assignment when a VM is
+# deallocated and reallocated, because the disk reattaches with no letter. The task runs
+# as SYSTEM at every boot before logon scripts fire, finding the 'VMsDisk' partition by
+# its NTFS label and assigning letter F if it is missing.
+$assignDiskScriptPath = "$Env:ArcBoxDir\AssignVMsDisk.ps1"
+@'
+# Reassign F: drive letter to the VMsDisk partition if it was lost after VM deallocation
+$part = Get-Partition | Where-Object { -not $_.DriveLetter } |
+    Where-Object { (Get-Volume -Partition $_ -ErrorAction SilentlyContinue).FileSystemLabel -eq 'VMsDisk' }
+if ($part) {
+    $part | Set-Partition -NewDriveLetter F
+}
+'@ | Set-Content -Path $assignDiskScriptPath -Force
+
+$taskAction    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                     -Argument "-NonInteractive -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$assignDiskScriptPath`""
+$taskTrigger   = New-ScheduledTaskTrigger -AtStartup
+$taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName 'ArcBox-AssignVMsDisk' `
+    -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal `
+    -Description 'Reassigns F: drive letter to VMsDisk partition after VM deallocation' `
+    -Force | Out-Null
+
 Start-Transcript -Path $Env:ArcBoxLogsDir\Bootstrap.log
 
 # SyncForegroundPolicy=1 makes Windows wait for GP sync before completing logon.
