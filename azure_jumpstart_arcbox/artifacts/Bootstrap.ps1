@@ -83,7 +83,10 @@ if ($debugEnabled -eq "true") {
 }
 
 # Formatting VMs disk
-$disk = (Get-Disk | Where-Object partitionstyle -eq 'raw')[0]
+# Explicitly select the managed data disk (SCSI bus) to avoid accidentally formatting
+# the ephemeral local NVMe temp disk present on 'ads' VM SKUs (e.g. Standard_D8ads_v6),
+# which is lost on every deallocation.
+$disk = Get-Disk | Where-Object { $_.PartitionStyle -eq 'RAW' -and $_.BusType -ne 'NVMe' } | Select-Object -First 1
 $driveLetter = "F"
 $label = "VMsDisk"
 $disk | Initialize-Disk -PartitionStyle MBR -PassThru | `

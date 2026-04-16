@@ -313,7 +313,11 @@ if ($Env:flavor -ne 'DevOps') {
     # Restarting Windows VM Network Adapters
     Write-Host 'Restarting Network Adapters'
     Start-Sleep -Seconds 5
-    Invoke-Command -VMName $SQLvmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+    try {
+        Invoke-Command -VMName $SQLvmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+    } catch {
+        # Restart-NetAdapter severs the PowerShell Direct session; this OpenError is expected
+    }
     Start-Sleep -Seconds 20
 
     # Rename server if hostname is not as ArcBox-SQL or doesn't match naming prefix
@@ -710,6 +714,21 @@ if ($Env:flavor -ne 'DevOps') {
     # the wheel.  Install them one round at a time with 'pip install --no-deps --target' so that
     # each newly installed package's own imports are discovered in the next round.
     # files.pythonhosted.org is reachable from Azure Gov private-endpoint VMs even when pypi.org is not.
+    #
+    # msrestazure is a known lazy dep: azure.common.credentials imports it only when a real command
+    # runs (not during --help), so the dep-repair loop never detects it.  Pre-install it explicitly.
+    $knownLazyDeps = @('msrestazure')
+    if ($arcdataVersion -and $cliPythonExe) {
+        foreach ($lazyDep in $knownLazyDeps) {
+            $out = & $cliPythonExe -m pip install $lazyDep --no-deps `
+                       --target "$azExtDir\arcdata" --disable-pip-version-check 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [known-dep pre-install] installed $lazyDep"
+            } else {
+                Write-Warning "  [known-dep pre-install] pip install $lazyDep failed: $($out | Select-Object -Last 3 | Out-String)"
+            }
+        }
+    }
     if ($arcdataVersion -and $cliPythonExe) {
         $maxDepRounds = 12
         for ($depRound = 1; $depRound -le $maxDepRounds; $depRound++) {
@@ -862,8 +881,16 @@ if ($Env:flavor -ne 'DevOps') {
         # Restarting Windows VM Network Adapters
         Write-Header 'Restarting Network Adapters'
         Start-Sleep -Seconds 5
-        Invoke-Command -VMName $Win2k22vmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
-        Invoke-Command -VMName $Win2k25vmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+        try {
+            Invoke-Command -VMName $Win2k22vmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+        } catch {
+            # Restart-NetAdapter severs the PowerShell Direct session; this OpenError is expected
+        }
+        try {
+            Invoke-Command -VMName $Win2k25vmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+        } catch {
+            # Restart-NetAdapter severs the PowerShell Direct session; this OpenError is expected
+        }
         Start-Sleep -Seconds 10
 
         if ($namingPrefix -ne 'ArcBox') {
