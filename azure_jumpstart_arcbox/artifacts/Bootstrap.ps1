@@ -611,6 +611,27 @@ if (-not (Test-Path $oobePath)) {
 }
 Set-ItemProperty -Path $oobePath -Name $oobeProperty -Value $oobeValue
 
+# Suppress the "New network found" / network-location-wizard dialog that interrupts
+# first logon. Creating 'NewNetworkWindowOff' disables the "Do you want this PC to be
+# discoverable?" balloon/wizard on Windows Server so the user is never prompted.
+$newNetPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff'
+if (-not (Test-Path $newNetPath)) {
+    New-Item -Path $newNetPath -Force | Out-Null
+}
+
+# Pre-assign all currently-connected adapters to Private so Windows does not show the
+# network-location prompt on first logon (even without the key above, setting the
+# profile here avoids the dialog for adapters that are already connected at boot).
+Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+    Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+
+# Suppress the first-logon animation ("Hi, let's set things up for you") on
+# Windows Server 2025. When this animation is shown, the autologon session is held
+# in a special pre-desktop state and AtLogOn scheduled tasks do not fire until
+# the animation completes or is dismissed interactively.
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' `
+    -Name 'EnableFirstLogonAnimation' -Value 0 -Type DWord -Force
+
 Write-Host "Registry keys and values for Diagnostic Data settings have been set successfully."
 
 # Change RDP Port
@@ -771,6 +792,21 @@ else {
 
     # Disabling Windows Server Manager Scheduled Task
     Get-ScheduledTask -TaskName ServerManager | Disable-ScheduledTask
+
+    # Suppress Server Manager opening on first logon for the admin user.
+    # Bootstrap runs as SYSTEM before the admin profile is created, so write the key to
+    # the Default User hive - Windows copies it to every new profile on creation,
+    # so the arcdemo account never sees Server Manager on first logon.
+    $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+    $mountPoint  = 'HKU\ArcBoxDefaultUser'
+    reg load $mountPoint $defaultHive 2>$null
+    if (Test-Path "Registry::HKU\ArcBoxDefaultUser") {
+        $smPath = "Registry::HKU\ArcBoxDefaultUser\SOFTWARE\Microsoft\ServerManager"
+        if (-not (Test-Path $smPath)) { New-Item -Path $smPath -Force | Out-Null }
+        Set-ItemProperty -Path $smPath -Name 'DoNotOpenServerManagerAtLogon' -Value 1 -Type DWord -Force
+        [GC]::Collect()
+        reg unload $mountPoint 2>$null
+    }
 
     if ($flavor -eq "ITPro") {
 
