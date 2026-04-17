@@ -291,6 +291,7 @@ if ($Env:flavor -ne 'DevOps') {
 
     # Verify if VHD files already downloaded especially when re-running this script
     if (!(Test-Path $SQLvmvhdPath)) {
+        New-Item -Path $Env:ArcBoxVMDir -ItemType Directory -Force | Out-Null
         Write-Output 'Downloading nested VMs VHDX file for SQL. This can take some time, hold tight...'
         azcopy cp $vhdSourceFolder $Env:ArcBoxVMDir --include-pattern "$vhdImageToDownload" --recursive=true --check-length=false --log-level=ERROR
 
@@ -811,6 +812,7 @@ if ($Env:flavor -ne 'DevOps') {
         # Verify if VHD files already downloaded especially when re-running this script
         if (!((Test-Path $Win2K25vmvhdPath) -and (Test-Path $Win2k22vmvhdPath) -and (Test-Path $Ubuntu01vmvhdPath) -and (Test-Path $Ubuntu02vmvhdPath))) {
             <# Action when all if and elseif conditions are false #>
+            New-Item -Path $Env:ArcBoxVMDir -ItemType Directory -Force | Out-Null
             $Env:AZCOPY_BUFFER_GB = 4
             Write-Output 'Downloading nested VMs VHDX files. This can take some time, hold tight...'
             azcopy cp $vhdSourceFolder $Env:ArcBoxVMDir --include-pattern $files --recursive=true --check-length=false --log-level=ERROR
