@@ -83,24 +83,28 @@ if ($debugEnabled -eq "true") {
 }
 
 # Formatting VMs disk
-# Explicitly select the managed data disk (SCSI bus) to avoid accidentally formatting
-# the ephemeral local NVMe temp disk present on 'ads' VM SKUs (e.g. Standard_E8ads_v6),
-# which is lost on every deallocation.
-# Retry for up to 60 s: the CustomScript extension can start before Windows fully
-# enumerates the SCSI data disk attached at LUN 0, leaving Get-Disk with no RAW result.
+# On Azure v6-series VMs (e.g. Standard_E8ads_v6), remote managed data disks are
+# attached via NVMe — the same bus type as the local NVMe temp disk. Filtering by
+# BusType -ne 'NVMe' therefore incorrectly excludes the managed disk on these SKUs.
+# Instead, identify the disk by its provisioned size (256 GiB as set in clientVm.bicep).
+# The local NVMe temp disk on E8ads_v6 is 300 GiB, so this unambiguously selects the
+# correct disk regardless of bus type.
+# Retry for up to 120 s: the CustomScript extension can start before Windows fully
+# enumerates the data disk attached at LUN 0, leaving Get-Disk with no RAW result.
+$managedDiskSizeBytes = 256GB   # must match diskSizeGB in clientVm.bicep
 $disk = $null
-$maxWaitSecs = 60
+$maxWaitSecs = 120
 $waited = 0
 while (-not $disk -and $waited -lt $maxWaitSecs) {
-    $disk = Get-Disk | Where-Object { $_.PartitionStyle -eq 'RAW' -and $_.BusType -ne 'NVMe' } | Select-Object -First 1
+    $disk = Get-Disk | Where-Object { $_.PartitionStyle -eq 'RAW' -and $_.Size -eq $managedDiskSizeBytes } | Select-Object -First 1
     if (-not $disk) {
-        Write-Host "Managed data disk not yet available; waiting 10 s... ($waited s elapsed)"
+        Write-Host "Managed data disk (256 GiB, RAW) not yet available; waiting 10 s... ($waited s elapsed)"
         Start-Sleep -Seconds 10
         $waited += 10
     }
 }
 if (-not $disk) {
-    Write-Error "Managed data disk (RAW, non-NVMe) not found after ${maxWaitSecs}s. Cannot initialize F: drive."
+    Write-Error "Managed data disk (256 GiB, RAW) not found after ${maxWaitSecs}s. Cannot initialize F: drive."
     exit 1
 }
 $driveLetter = "F"
