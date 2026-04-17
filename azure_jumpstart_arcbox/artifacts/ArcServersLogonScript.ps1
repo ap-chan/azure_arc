@@ -315,19 +315,46 @@ if ($Env:flavor -ne 'DevOps') {
     Write-Host 'Restarting Network Adapters'
     Start-Sleep -Seconds 5
     try {
-        Invoke-Command -VMName $SQLvmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds
+        # 2>&1 | Out-Null redirects the PS Direct transport-level error stream so that
+        # the "OpenError: A remote session might have ended" message is suppressed from
+        # the transcript. try/catch alone is insufficient because OpenError is written
+        # directly to the error output stream before Invoke-Command can throw.
+        Invoke-Command -VMName $SQLvmName -ScriptBlock { Get-NetAdapter | Restart-NetAdapter } -Credential $winCreds 2>&1 | Out-Null
     } catch {
         # Restart-NetAdapter severs the PowerShell Direct session; this OpenError is expected
     }
     Start-Sleep -Seconds 20
 
     # Rename server if hostname is not as ArcBox-SQL or doesn't match naming prefix
-    $hostname = Invoke-Command -VMName $SQLvmName -ScriptBlock { hostname } -Credential $winCreds
+    # Wrap in try/catch: if the PS Direct session isn't fully stable after the network
+    # adapter restart, Invoke-Command can throw; fall back to the current machine name.
+    $hostname = $null
+    try {
+        $hostname = Invoke-Command -VMName $SQLvmName -ScriptBlock { hostname } -Credential $winCreds -ErrorAction SilentlyContinue 2>&1
+    } catch {
+        Write-Host "Could not read hostname from SQL VM (session not yet stable): $($_.Exception.Message)"
+    }
 
     if ($hostname -ne $SQLvmName) {
 
         Write-Header 'Renaming the nested SQL VM'
-        Invoke-Command -VMName $SQLvmName -ScriptBlock { Rename-Computer -NewName $using:SQLvmName -Restart } -Credential $winCreds
+        # Run Rename-Computer in a detached process so that the -Restart it triggers does not
+        # sever the PowerShell Direct session mid-call and produce an unhandleable OpenError.
+        # The separate process exits cleanly once Rename-Computer queues the restart; PS Direct
+        # itself is never open when the reboot fires, so no session-teardown error is thrown.
+        $renameLogPath = "$Env:ArcBoxLogsDir\SQL-Rename.log"
+        $renameBlock = [scriptblock]::Create("
+            Start-Transcript -Path '$renameLogPath' -Force
+            Rename-Computer -NewName '$SQLvmName' -Restart -Force
+            Stop-Transcript
+        ")
+        try {
+            Invoke-Command -VMName $SQLvmName -ScriptBlock $renameBlock -Credential $winCreds -ErrorAction SilentlyContinue
+        } catch {
+            # The session is torn down by the restart before the reply can be received;
+            # the OpenError here is expected and non-fatal.
+            Write-Host "Rename-Computer triggered a VM restart (OpenError expected, non-fatal): $($_.Exception.Message)"
+        }
 
         Get-VM *SQL* | Wait-VM -For IPAddress
 
@@ -341,6 +368,7 @@ if ($Env:flavor -ne 'DevOps') {
         }
 
         Write-Host 'VM has rebooted successfully!'
+        Write-Host "  Rename transcript: $renameLogPath"
     }
 
     # Enable Windows Firewall rule for SQL Server
@@ -518,40 +546,32 @@ if ($Env:flavor -ne 'DevOps') {
     # Run SQL Server Azure Migration Assessment
     Write-Host "Enabling SQL Server Azure Migration Assessment.`n"
 
-    # Wait for the SqlServerInstances resource to be created by the SQL extension before calling runMigrationAssessment.
-    # IMPORTANT: The SqlServerInstances resource name is NOT the machine name — it is '<MachineName>_<SQLInstanceName>'
-    # (e.g. 'arcva-SQL_MSSQLSERVER' for the default instance). Discover it via az resource list filtered by name prefix
-    # to avoid hard-coding the instance name and to handle non-default instance names.
-    # NOTE: Invoke-WebRequest with a manual Bearer token and a preview API version is avoided here because
-    # Azure Government does not always expose the same preview API versions as public Azure, causing
-    # non-2xx responses (empty body '{}') that make every retry fail. Using az resource list lets the
-    # CLI handle cloud-specific endpoints and API version negotiation automatically.
+    # Discover the SqlServerInstances resource name created by the SQL extension.
+    # IMPORTANT: The resource name is '<MachineName>_<SQLInstanceName>' (e.g. 'arcva-SQL_MSSQLSERVER'),
+    # NOT the machine name alone. Query once; fall back to the conventional default-instance name
+    # '<MachineName>_MSSQLSERVER' if the resource is not yet visible.
+    # The migration assessment API call is best-effort — if the resource is not yet created the
+    # portal will show it as pending and the user can trigger it manually.
+    Write-Host "Discovering SqlServerInstances resource for machine '$SQLvmName'..."
     $sqlInstanceResourceName = $null
-    $retryCount = 0
-    do {
-        $listJson = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' --query "[?starts_with(name, '$SQLvmName')]" -o json 2>$null
-        if ($listJson) {
-            $instances = $listJson | ConvertFrom-Json
-            if ($instances -and $instances.Count -gt 0) {
-                $sqlInstanceResourceName = $instances[0].name
-                Write-Host "SqlServerInstances resource '$sqlInstanceResourceName' found for machine '$SQLvmName'."
-                break
-            }
+    $listJson = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' --query "[?starts_with(name, '$SQLvmName')]" -o json 2>$null
+    if ($listJson) {
+        $instances = $listJson | ConvertFrom-Json
+        if ($instances -and $instances.Count -gt 0) {
+            $sqlInstanceResourceName = $instances[0].name
+            Write-Host "  SqlServerInstances resource found: '$sqlInstanceResourceName'"
         }
-        $retryCount++
-        if ($retryCount -gt 60) {
-            Write-Warning "Timeout waiting for SqlServerInstances resource '$SQLvmName'. Migration assessment may fail."
-            # Diagnostic: list ALL AzureArcData resources in the RG to help troubleshoot
-            $allArcData = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' -o json 2>$null
-            Write-Host "All Microsoft.AzureArcData/sqlServerInstances in RG at timeout: $allArcData"
-            break
-        }
-        Write-Host "Waiting for SqlServerInstances resource to be created ... Retry count: $retryCount"
-        Start-Sleep(30)
-    } while ($retryCount -le 60)
-
-    # Fall back to machine name if discovery failed (preserves prior behaviour)
-    if (-not $sqlInstanceResourceName) { $sqlInstanceResourceName = $SQLvmName }
+    }
+    if (-not $sqlInstanceResourceName) {
+        # Resource not yet created by the extension — use the conventional default-instance fallback
+        $sqlInstanceResourceName = "${SQLvmName}_MSSQLSERVER"
+        Write-Host "  SqlServerInstances resource not yet visible; using fallback name '$sqlInstanceResourceName'."
+        Write-Host "  If migration assessment fails, trigger it manually from the Azure portal once the resource appears."
+        # Log all AzureArcData resources in the RG for diagnostics
+        $allArcData = az resource list --resource-group $resourceGroup --resource-type 'Microsoft.AzureArcData/sqlServerInstances' -o json 2>$null
+        "$(Get-Date -Format 'u') SqlServerInstances resources in RG: $allArcData" | `
+            Add-Content -Path "$Env:ArcBoxLogsDir\SqlServerInstances-discovery.log" -Force
+    }
 
     # Refresh token — the retry loop above can run for up to 15 minutes, potentially staling the token
     # obtained earlier in the script.
@@ -718,7 +738,13 @@ if ($Env:flavor -ne 'DevOps') {
     #
     # msrestazure is a known lazy dep: azure.common.credentials imports it only when a real command
     # runs (not during --help), so the dep-repair loop never detects it.  Pre-install it explicitly.
-    $knownLazyDeps = @('msrestazure')
+    # IMPORTANT: --target must point to a directory that is on sys.path when az runs the extension.
+    # The CLI adds <extdir>/arcdata to sys.path, so packages must land directly there (not in a
+    # nested lib/ subdir).  Using --target "$azExtDir\arcdata" (the extension root) is correct;
+    # however pip --no-deps with --target does not write a .pth file, so top-level package dirs
+    # are importable directly from the target.  The previous version was correct in target path;
+    # the real gap was that msrestazure itself depends on adal which was missing.  Install both.
+    $knownLazyDeps = @('msrestazure', 'adal')
     if ($arcdataVersion -and $cliPythonExe) {
         foreach ($lazyDep in $knownLazyDeps) {
             $out = & $cliPythonExe -m pip install $lazyDep --no-deps `
@@ -728,6 +754,17 @@ if ($Env:flavor -ne 'DevOps') {
             } else {
                 Write-Warning "  [known-dep pre-install] pip install $lazyDep failed: $($out | Select-Object -Last 3 | Out-String)"
             }
+        }
+        # Verify that msrestazure is importable by the CLI Python before proceeding
+        $verifyOut = & $cliPythonExe -c 'import msrestazure; print(msrestazure.__version__)' 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  msrestazure importable: $verifyOut"
+        } else {
+            Write-Warning "  msrestazure still not importable after pre-install: $verifyOut"
+            # Detailed pip log for diagnosis
+            $pipLog = & $cliPythonExe -m pip show msrestazure 2>&1 | Out-String
+            "$(Get-Date -Format 'u') msrestazure pre-install verify failed.`n$pipLog" | `
+                Add-Content -Path "$Env:ArcBoxLogsDir\arcdata-deps.log" -Force
         }
     }
     if ($arcdataVersion -and $cliPythonExe) {
