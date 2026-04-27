@@ -349,7 +349,10 @@ if ($Env:flavor -ne 'DevOps') {
             Stop-Transcript
         ")
         try {
-            Invoke-Command -VMName $SQLvmName -ScriptBlock $renameBlock -Credential $winCreds -ErrorAction SilentlyContinue
+            # 2>&1 | Out-Null suppresses the transport-level OpenError that is written to the
+            # error stream before Invoke-Command can throw when the VM restarts mid-call.
+            # try/catch alone is insufficient (same pattern as Restart-NetAdapter above).
+            Invoke-Command -VMName $SQLvmName -ScriptBlock $renameBlock -Credential $winCreds -ErrorAction SilentlyContinue 2>&1 | Out-Null
         } catch {
             # The session is torn down by the restart before the reply can be received;
             # the OpenError here is expected and non-fatal.
@@ -744,8 +747,23 @@ if ($Env:flavor -ne 'DevOps') {
     # however pip --no-deps with --target does not write a .pth file, so top-level package dirs
     # are importable directly from the target.  The previous version was correct in target path;
     # the real gap was that msrestazure itself depends on adal which was missing.  Install both.
+    # CRITICAL: msrestazure and adal have their own transitive dependencies (msrest, azure-common,
+    # requests, pycryptodome, python-dateutil, PyJWT, etc.).  Installing with --no-deps alone will
+    # leave these missing, causing "import msrestazure" to fail later.  Pre-install their deps first.
+    $knownLazyDepsDeps = @('msrest', 'azure-common', 'requests', 'pycryptodome', 'python-dateutil', 'PyJWT')
     $knownLazyDeps = @('msrestazure', 'adal')
     if ($arcdataVersion -and $cliPythonExe) {
+        # First pass: install all transitive dependencies of the lazy deps
+        foreach ($depPkg in $knownLazyDepsDeps) {
+            $out = & $cliPythonExe -m pip install $depPkg --no-deps `
+                       --target "$azExtDir\arcdata" --disable-pip-version-check 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [known-dep pre-install] installed transitive dep: $depPkg"
+            } else {
+                Write-Warning "  [known-dep pre-install] pip install $depPkg failed: $($out | Select-Object -Last 3 | Out-String)"
+            }
+        }
+        # Second pass: install the lazy deps themselves (now that their deps are available)
         foreach ($lazyDep in $knownLazyDeps) {
             $out = & $cliPythonExe -m pip install $lazyDep --no-deps `
                        --target "$azExtDir\arcdata" --disable-pip-version-check 2>&1
@@ -755,15 +773,19 @@ if ($Env:flavor -ne 'DevOps') {
                 Write-Warning "  [known-dep pre-install] pip install $lazyDep failed: $($out | Select-Object -Last 3 | Out-String)"
             }
         }
-        # Verify that msrestazure is importable by the CLI Python before proceeding
-        $verifyOut = & $cliPythonExe -c 'import msrestazure; print(msrestazure.__version__)' 2>&1
+        # Verify that msrestazure is importable from the arcdata extension directory.
+        # The bare Python process has no knowledge of the extension dir, so we must
+        # inject it into sys.path explicitly — this mirrors what az does when it loads
+        # the extension at runtime.
+        $arcExtPath = "$azExtDir\arcdata".Replace('\', '\\')
+        $verifyOut = & $cliPythonExe -c "import sys; sys.path.insert(0, '$arcExtPath'); import msrestazure; print(msrestazure.__version__)" 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "  msrestazure importable: $verifyOut"
+            Write-Host "  msrestazure importable from arcdata dir: $verifyOut"
         } else {
-            Write-Warning "  msrestazure still not importable after pre-install: $verifyOut"
-            # Detailed pip log for diagnosis
+            Write-Warning "  msrestazure still not importable from arcdata dir after pre-install: $verifyOut"
+            # Detailed pip show for diagnosis
             $pipLog = & $cliPythonExe -m pip show msrestazure 2>&1 | Out-String
-            "$(Get-Date -Format 'u') msrestazure pre-install verify failed.`n$pipLog" | `
+            "$(Get-Date -Format 'u') msrestazure verify failed.`n$pipLog" | `
                 Add-Content -Path "$Env:ArcBoxLogsDir\arcdata-deps.log" -Force
         }
     }
@@ -807,13 +829,28 @@ if ($Env:flavor -ne 'DevOps') {
         }
     }
 
-    # Enable least privileged access
+    # Enable least privileged access and automated backups via arcdata extension.
+    # az sql server-arc commands use AZURE_ENDPOINT_RESOURCE_MANAGER to determine
+    # the ARM endpoint; they do NOT reliably inherit the `az cloud set` state that
+    # was set earlier. Set the env var explicitly when targeting Azure Government so
+    # the extension hits management.usgovcloudapi.net instead of management.azure.com.
+    # Without this, arcdata sends requests to commercial Azure and gets
+    # "SubscriptionNotFound" or "Could not find SQL Server" even though the resource exists.
+    if ($azureEnvironment -eq 'AzureUSGovernment') {
+        $env:AZURE_ENDPOINT_RESOURCE_MANAGER = 'https://management.usgovcloudapi.net/'
+    }
+
     Write-Host "Enabling Arc-enabled SQL server least privileged access.`n"
-    az sql server-arc extension feature-flag set --name LeastPrivilege --enable true --resource-group $resourceGroup --machine-name $SQLvmName
+    az sql server-arc extension feature-flag set --name LeastPrivilege --enable true --resource-group $resourceGroup --machine-name $SQLvmName --subscription $subscriptionId
 
     # Enable automated backups
     Write-Host "Enabling Arc-enabled SQL server automated backups.`n"
-    az sql server-arc backups-policy set --name $SQLvmName --resource-group $resourceGroup --retention-days 31 --full-backup-days 7 --diff-backup-hours 12 --tlog-backup-mins 5
+    az sql server-arc backups-policy set --name $SQLvmName --resource-group $resourceGroup --retention-days 31 --full-backup-days 7 --diff-backup-hours 12 --tlog-backup-mins 5 --subscription $subscriptionId
+
+    # Restore env var so subsequent az commands continue using the standard cloud config
+    if ($azureEnvironment -eq 'AzureUSGovernment') {
+        Remove-Item Env:\AZURE_ENDPOINT_RESOURCE_MANAGER -ErrorAction SilentlyContinue
+    }
 
     # Onboard nested Windows and Linux VMs to Azure Arc
     if ($Env:flavor -eq 'ITPro') {
