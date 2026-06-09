@@ -193,10 +193,12 @@ Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 
 Install-Module -Name Microsoft.PowerShell.PSResourceGet -Force -AllowClobber
 
-# Pin Az-modules at minimum known-working versions, then update to latest.
-# Pinning first avoids version-conflict issues on initial install (see: https://github.com/microsoft/azure_arc/issues/3359).
-# Update-PSResource then brings each module to the latest available stable release so that
-# "you're using an older version" warnings from Az are eliminated on every subsequent run.
+# Pin Az-modules at known-working versions. Do NOT update to latest: newer Az.Accounts
+# bundles Azure.Identity 1.17.x, whose ManagedIdentityCredential.GetTokenAsync fails to
+# load under Windows PowerShell 5.1 (.NET Framework) with
+# "Method 'GetTokenAsync' ... does not have an implementation", breaking
+# Connect-AzAccount -Identity. Pinning Az.Accounts 5.3.1 keeps a compatible Azure.Identity.
+# (see: https://github.com/microsoft/azure_arc/issues/3359).
 Install-PSResource -Name Az.Accounts -Version 5.3.1 -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Reinstall
 Install-PSResource -Name Az.KeyVault -Version 6.4.1 -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Reinstall
 Install-PSResource -Name Az.Compute -Version 11.1.0 -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Reinstall
@@ -204,24 +206,10 @@ Install-PSResource -Name Az.Resources -Version 9.0.0 -Scope AllUsers -Quiet -Acc
 Install-PSResource -Name Az.Storage -Version 9.4.0  -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Reinstall
 Install-PSResource -Name Microsoft.PowerShell.SecretManagement -Version 1.1.2 -Scope AllUsers -Quiet -AcceptLicense -TrustRepository -Reinstall
 
-# Update all Az modules to latest stable so version-outdated warnings are suppressed.
-Write-Host "Checking for Az module updates..."
-$azModulesToUpdate = @('Az.Accounts', 'Az.KeyVault', 'Az.Compute', 'Az.Resources', 'Az.Storage')
-foreach ($modName in $azModulesToUpdate) {
-    try {
-        Update-PSResource -Name $modName -Scope AllUsers -AcceptLicense -TrustRepository -ErrorAction SilentlyContinue
-        $installedVer = (Get-InstalledPSResource -Name $modName -ErrorAction SilentlyContinue |
-                         Sort-Object Version -Descending | Select-Object -First 1).Version
-        Write-Host "  $modName : $installedVer"
-    } catch {
-        Write-Warning "  Could not update ${modName}: $($_.Exception.Message)"
-    }
-}
-
-# Import the modules — no -RequiredVersion so the latest installed version is loaded.
-Import-Module Az.Accounts -Force
-Import-Module Az.KeyVault -Force
-Import-Module Az.Resources -Force
+# Import the exact pinned versions so the known-good Azure.Identity is loaded.
+Import-Module Az.Accounts -RequiredVersion 5.3.1 -Force
+Import-Module Az.KeyVault -RequiredVersion 6.4.1 -Force
+Import-Module Az.Resources -RequiredVersion 9.0.0 -Force
 
 $DeploymentProgressString = "Started bootstrap-script..."
 
