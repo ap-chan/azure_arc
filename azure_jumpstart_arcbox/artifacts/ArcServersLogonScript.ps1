@@ -416,7 +416,7 @@ if ($Env:flavor -ne 'DevOps') {
     # Create SQL server extension as policy to auto deployment is disabled
     Write-Host "Installing SQL Server extension on the Arc-enabled Server.`n"
     az connectedmachine extension create --machine-name $SQLvmName --name 'WindowsAgent.SqlServer' --resource-group $resourceGroup --type 'WindowsAgent.SqlServer' --publisher 'Microsoft.AzureData' --settings '{\"LicenseType\":\"Paid\", \"SqlManagement\": {\"IsEnabled\":true}}' --tags $resourceTags --location $azureLocation --only-show-errors --no-wait
-    Write-Host 'SQL Server extension installation on the Arc-enabled Server successful.'
+    Write-Host 'SQL Server extension creation request submitted (running asynchronously; provisioning verified below).'
 
     $retryCount = 0
     do {
@@ -429,14 +429,14 @@ if ($Env:flavor -ne 'DevOps') {
         } else {
             # Arc SQL Server extension is not installed or still in progress.
             $retryCount = $retryCount + 1
-            if ($retryCount -gt 20) {
+            if ($retryCount -gt 40) {
                 Write-Warning "Timeout exceeded installing SQL server extension. Retry count: $retryCount."
             } else {
                 Write-Host "Waiting for SQL server extension installation ... Retry count: $retryCount"
                 Start-Sleep(30)
             }
         }
-    } while ($retryCount -le 20)
+    } while ($retryCount -le 40)
 
     # Register Microsoft.AzureArcData provider - required for SqlServerInstances resource and migration assessment.
     # The VM managed identity has Owner at RG scope but 'register/action' requires subscription scope.
