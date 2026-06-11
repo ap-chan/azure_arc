@@ -54,3 +54,7 @@ terraform.rc
 *.out
 .VSCodeCounter/*
 azure_jumpstart_ag/manufacturing/bicep/main.*.parameters.json
+
+# Personal ArcBox deployment files (local only, never push)
+/azure_jumpstart_arcbox/arcboxva.ps1
+/azure_jumpstart_arcbox/main.bicepparam
