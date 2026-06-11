@@ -113,6 +113,11 @@ param zones string?
 param registryPassword string = newGuid()
 
 var templateBaseUrl = 'https://raw.githubusercontent.com/${githubAccount}/azure_arc/${githubBranch}/azure_jumpstart_arcbox/'
+// Shorten the Windows admin password to 15 characters so the value stored in Key Vault
+// (and used to log in to the client VM) is easier to type. The first 12 characters come
+// from the random GUID; the 'Aa1' suffix guarantees the Windows complexity requirement
+// (upper + lower + number) is always met within the 15-character limit.
+var windowsAdminPasswordShort = '${substring(windowsAdminPassword, 0, 12)}Aa1'
 var aksArcDataClusterName = '${namingPrefix}-AKS-Data-${guid}'
 var aksDrArcDataClusterName = '${namingPrefix}-AKS-DR-Data-${guid}'
 var k3sArcDataClusterName = '${namingPrefix}-K3s-Data-${guid}'
@@ -194,7 +199,7 @@ module clientVmDeployment 'clientVm/clientVm.bicep' = {
   name: 'clientVmDeployment'
   params: {
     windowsAdminUsername: windowsAdminUsername
-    windowsAdminPassword: windowsAdminPassword
+    windowsAdminPassword: windowsAdminPasswordShort
     tenantId: tenantId
     workspaceName: logAnalyticsWorkspaceName
     stagingStorageAccountName: toLower(stagingStorageAccountDeployment.outputs.storageAccountName)
@@ -250,7 +255,7 @@ module mgmtArtifactsAndPolicyDeployment 'mgmt/mgmtArtifacts.bicep' = {
     location: location
     resourceTags: resourceTags
     namingPrefix: namingPrefix
-    windowsAdminPassword: windowsAdminPassword
+    windowsAdminPassword: windowsAdminPasswordShort
     registryPassword: registryPassword
     natGatewayName: natGatewayName
     azureEnvironment: azureEnvironment
@@ -261,7 +266,7 @@ module addsVmDeployment 'mgmt/addsVm.bicep' = if (flavor == 'DataOps'){
   name: 'addsVmDeployment'
   params: {
     windowsAdminUsername : windowsAdminUsername
-    windowsAdminPassword : windowsAdminPassword
+    windowsAdminPassword : windowsAdminPasswordShort
     addsDomainName: addsDomainName
     deployBastion: deployBastion
     templateBaseUrl: templateBaseUrl
